@@ -2,7 +2,7 @@
   "name": "duo-bridge-poc",
   "displayName": "Duo Agent",
   "description": "Builds reviewed code-change prompts for GitLab Duo Quick Chat and safely applies validated Git patches.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "publisher": "local",
   "engines": {
