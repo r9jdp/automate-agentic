@@ -27,10 +27,17 @@ It does not commit, push, open merge requests, execute generated shell commands,
 duo-bridge-poc/
 ├── package.json
 ├── extension.js
+├── src/
+│   ├── runtime.js
+│   ├── git.js
+│   ├── paths.js
+│   ├── prompt.js
+│   ├── patch.js
+│   └── workflow.js
 └── README.md
 ```
 
-There are no npm dependencies and no build step.
+`extension.js` only registers commands. The `src` modules separate Git execution, path validation, master-prompt construction, patch validation/application, and the interactive workflow. There are no npm dependencies and no build step.
 
 ## Workflow
 
@@ -120,7 +127,7 @@ In VS Code:
 
 1. Press `F5`.
 2. A new **Extension Development Host** window opens.
-3. In that new window, open the Git repository you want Duo Agent to modify.
+3. In that new window, open the **root folder** of the Git repository you want Duo Agent to modify. Do not open only a nested subfolder.
 4. Open a relevant source file.
 5. Confirm GitLab Duo Quick Chat works manually.
 
@@ -350,6 +357,16 @@ Likely causes:
 - GitLab Duo produced an invalid diff
 
 Regenerate the task with current and more relevant context files.
+
+### Open the repository root
+
+Error:
+
+```text
+Open the Git repository root as the VS Code workspace before running Duo Agent.
+```
+
+Close the current folder and open the folder that contains the repository's `.git` directory. This prevents the extension from modifying files outside the trusted VS Code workspace.
 
 ### The repository has no commits
 
