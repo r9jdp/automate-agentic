@@ -9,6 +9,7 @@ const {
   PENDING_KEY,
   LAST_PROMPT_KEY,
   getConfiguration,
+  getOutput,
   log,
   wait,
   sendToGitLab
@@ -34,7 +35,7 @@ const {
   validatePatch,
   previewPatch,
   applyPatch,
-  undoLastApply
+  undoLastApply: undoLastApplyPatch
 } = require('./patch');
 
 let applyingResponse = false;
@@ -162,7 +163,8 @@ async function chooseContextFiles(
 async function readContext(
   repositoryRoot,
   files,
-  configuration
+  configuration,
+  requestId
 ) {
   const chunks = [];
   let totalCharacters = 0;
@@ -211,9 +213,10 @@ async function readContext(
 
     totalCharacters += content.length;
     chunks.push(
-      `FILE_CONTEXT_BEGIN\nPATH: ${file}\n` +
-        `CONTENT_BEGIN\n${content}\n` +
-        'CONTENT_END\nFILE_CONTEXT_END'
+      `FILE_CONTEXT_BEGIN ${requestId}\nPATH: ${file}\n` +
+        `CONTENT_BEGIN ${requestId}\n${content}\n` +
+        `CONTENT_END ${requestId}\n` +
+        `FILE_CONTEXT_END ${requestId}`
     );
   }
 
@@ -252,8 +255,9 @@ async function readContext(
 
       totalCharacters += selection.length;
       chunks.push(
-        `ACTIVE_SELECTION_BEGIN\nPATH: ${relativePath}\n` +
-          `${selection}\nACTIVE_SELECTION_END`
+        `ACTIVE_SELECTION_BEGIN ${requestId}\n` +
+          `PATH: ${relativePath}\n${selection}\n` +
+          `ACTIVE_SELECTION_END ${requestId}`
       );
     }
   }
@@ -265,6 +269,12 @@ async function readContext(
 }
 
 async function applyFromClipboard(context) {
+  if (!vscode.workspace.isTrusted) {
+    throw new Error(
+      'Trust the workspace before applying Duo Agent changes.'
+    );
+  }
+
   if (applyingResponse) {
     throw new Error(
       'A Duo Agent response is already being validated or applied.'
@@ -411,6 +421,10 @@ async function runTask(context) {
     );
   }
 
+  const outputChannel = getOutput();
+  outputChannel.clear();
+  outputChannel.show(true);
+
   const folder = await chooseWorkspaceFolder();
   const repositoryRoot = await resolveRepositoryRoot(folder);
   const configuration = getConfiguration(folder.uri);
@@ -517,12 +531,13 @@ async function runTask(context) {
     allFiles,
     configuration
   );
+  const requestId = randomUUID();
   const contextText = await readContext(
     repositoryRoot,
     contextFiles,
-    configuration
+    configuration,
+    requestId
   );
-  const requestId = randomUUID();
   const prompt = buildMasterPrompt({
     requestId,
     task: task.trim(),
@@ -537,6 +552,7 @@ async function runTask(context) {
     repositoryRoot,
     baseCommit,
     allowedPaths,
+    contextFiles,
     allowDelete: deletion.value,
     createdAt: new Date().toISOString()
   };
@@ -578,6 +594,16 @@ async function runTask(context) {
       }`
     );
   });
+}
+
+async function undoLastApply(context) {
+  if (!vscode.workspace.isTrusted) {
+    throw new Error(
+      'Trust the workspace before restoring Duo Agent changes.'
+    );
+  }
+
+  await undoLastApplyPatch(context);
 }
 
 async function copyLastPrompt(context) {
