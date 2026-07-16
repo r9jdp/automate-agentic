@@ -1,17 +1,33 @@
 {
   "name": "duo-bridge-poc",
   "displayName": "Duo Bridge POC",
-  "version": "0.0.1",
+  "description": "Verifies command-based integration with GitLab Duo Quick Chat.",
+  "version": "0.0.2",
   "private": true,
-  "engines": { "vscode": "^1.92.0" },
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.92.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "main": "./extension.js",
-  "activationEvents": ["onCommand:duoBridge.verify"],
-  "extensionDependencies": ["GitLab.gitlab-workflow"],
+  "activationEvents": [
+    "onCommand:duoBridge.verify",
+    "onCommand:duoBridge.copyAndOpen"
+  ],
+  "extensionDependencies": [
+    "GitLab.gitlab-workflow"
+  ],
   "contributes": {
     "commands": [
       {
         "command": "duoBridge.verify",
-        "title": "Duo Bridge: Verify"
+        "title": "Duo Bridge: Verify Static Send"
+      },
+      {
+        "command": "duoBridge.copyAndOpen",
+        "title": "Duo Bridge: Copy Prompt and Open Chat"
       }
     ]
   }
