@@ -22,8 +22,8 @@ const {
 } = require('./paths');
 const { branchSlug } = require('./prompt');
 
-function changedPathsFromPatch(patch) {
-  const paths = [];
+function changesFromPatch(patch) {
+  const changes = [];
   const seenPaths = new Set();
   let section;
 
@@ -35,6 +35,19 @@ function changedPathsFromPatch(patch) {
         `Patch section for ${section.path} lacks --- or +++ headers.`
       );
     }
+
+    let action = 'modify';
+
+    if (section.oldPath === null) {
+      action = 'create';
+    } else if (section.newPath === null) {
+      action = 'delete';
+    }
+
+    changes.push({
+      path: section.path,
+      action
+    });
   };
 
   for (const line of patch.split(/\r?\n/)) {
@@ -68,11 +81,12 @@ function changedPathsFromPatch(patch) {
       }
 
       seenPaths.add(key);
-      paths.push(relativePath);
       section = {
         path: relativePath,
         oldHeader: false,
         newHeader: false,
+        oldPath: undefined,
+        newPath: undefined,
         inHunk: false
       };
       continue;
@@ -118,6 +132,7 @@ function changedPathsFromPatch(patch) {
     }
 
     const expectedPrefix = oldHeader ? 'a/' : 'b/';
+    let relativePath = null;
 
     if (patchPath !== '/dev/null') {
       if (!patchPath.startsWith(expectedPrefix)) {
@@ -126,7 +141,7 @@ function changedPathsFromPatch(patch) {
         );
       }
 
-      const relativePath = normalizeRepositoryPath(
+      relativePath = normalizeRepositoryPath(
         patchPath.slice(expectedPrefix.length)
       );
 
@@ -137,17 +152,28 @@ function changedPathsFromPatch(patch) {
       }
     }
 
-    if (oldHeader) section.oldHeader = true;
-    else section.newHeader = true;
+    if (oldHeader) {
+      section.oldHeader = true;
+      section.oldPath = relativePath;
+    } else {
+      section.newHeader = true;
+      section.newPath = relativePath;
+    }
   }
 
   finishSection();
 
-  if (paths.length === 0) {
+  if (changes.length === 0) {
     throw new Error('Patch contains no diff --git sections.');
   }
 
-  return paths.sort((left, right) => left.localeCompare(right));
+  return changes.sort((left, right) =>
+    left.path.localeCompare(right.path)
+  );
+}
+
+function changedPathsFromPatch(patch) {
+  return changesFromPatch(patch).map(change => change.path);
 }
 
 function patchDeletesFile(patch) {
@@ -221,20 +247,34 @@ async function validatePatch(
 ) {
   validatePatchStructure(patch, pending, configuration);
 
-  const changedPaths = changedPathsFromPatch(patch);
+  const changes = changesFromPatch(patch);
+  const contextFiles = new Set(
+    (pending.contextFiles ?? []).map(value => pathKey(value))
+  );
 
-  for (const changedPath of changedPaths) {
-    if (!isPathAllowed(changedPath, pending.allowedPaths)) {
+  for (const change of changes) {
+    if (!isPathAllowed(change.path, pending.allowedPaths)) {
       throw new Error(
-        `Patch path is outside writable scope: ${changedPath}`
+        `Patch path is outside writable scope: ${change.path}`
+      );
+    }
+
+    if (
+      change.action !== 'create' &&
+      !contextFiles.has(pathKey(change.path))
+    ) {
+      throw new Error(
+        `Existing file was not supplied as complete context: ${change.path}`
       );
     }
 
     await requireNoSymlinkTraversal(
       repositoryRoot,
-      changedPath
+      change.path
     );
   }
+
+  const changedPaths = changes.map(change => change.path);
 
   const temporaryPatch = path.join(
     os.tmpdir(),
@@ -502,6 +542,7 @@ async function undoLastApply(context) {
 }
 
 module.exports = {
+  changesFromPatch,
   changedPathsFromPatch,
   patchDeletesFile,
   validatePatchStructure,
