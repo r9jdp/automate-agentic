@@ -2,7 +2,6 @@
 
 const vscode = require('vscode');
 const path = require('path');
-const fs = require('fs/promises');
 const { randomUUID } = require('crypto');
 const { TextDecoder } = require('util');
 const {
@@ -17,14 +16,14 @@ const {
 } = require('./runtime');
 const {
   resolveRepositoryRoot,
-  requireHead,
-  requireClean,
-  trackedFiles
+  currentBranch,
+  repositoryFiles,
+  statusSummary
 } = require('./git');
 const {
   repositoryPath,
   parseAllowedPaths,
-  requireNoSymlinkTraversal
+  pathKey
 } = require('./paths');
 const {
   buildMasterPrompt,
@@ -32,11 +31,11 @@ const {
   clipboardContainsResponse
 } = require('./prompt');
 const {
-  sha256Buffer,
+  readFileState,
   validatePlan,
   previewPlan,
   applyPlan,
-  undoLastApply: undoLastOperationPlan
+  undoLastApply: undoLastFileChanges
 } = require('./operations');
 
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
@@ -46,14 +45,10 @@ async function chooseWorkspaceFolder() {
   const folders = vscode.workspace.workspaceFolders ?? [];
 
   if (folders.length === 0) {
-    throw new Error(
-      'Open a folder containing a Git repository first.'
-    );
+    throw new Error('Open a Git repository folder first.');
   }
 
-  if (folders.length === 1) {
-    return folders[0];
-  }
+  if (folders.length === 1) return folders[0];
 
   const activeUri = vscode.window.activeTextEditor?.document.uri;
   const activeFolder = activeUri
@@ -67,61 +62,25 @@ async function chooseWorkspaceFolder() {
       picked: folder === activeFolder
     })),
     {
-      title: 'Duo Agent: choose workspace',
+      title: 'Duo Agent: choose the project to edit',
       ignoreFocusOut: true
     }
   );
 
   if (!selected) {
-    throw new Error('Workspace selection cancelled.');
+    throw new Error('Project selection cancelled.');
   }
 
   return selected.folder;
 }
 
-async function saveDirtyDocuments(repositoryRoot) {
-  const dirty = vscode.workspace.textDocuments
-    .filter(
-      document =>
-        document.isDirty && document.uri.scheme === 'file'
+function openRepositoryDocumentPaths(repositoryRoot) {
+  return vscode.workspace.textDocuments
+    .filter(document => document.uri.scheme === 'file')
+    .map(document =>
+      repositoryPath(repositoryRoot, document.uri.fsPath)
     )
-    .map(document => ({
-      document,
-      relativePath: repositoryPath(
-        repositoryRoot,
-        document.uri.fsPath
-      )
-    }))
-    .filter(
-      item =>
-        item.relativePath && item.relativePath !== '.'
-    );
-
-  if (dirty.length === 0) {
-    return;
-  }
-
-  const approval = await vscode.window.showWarningMessage(
-    'Duo Agent must save dirty files before it builds context ' +
-      'or applies changes.',
-    {
-      modal: true,
-      detail: dirty.map(item => item.relativePath).join('\n')
-    },
-    'Save All and Continue'
-  );
-
-  if (approval !== 'Save All and Continue') {
-    throw new Error('Unsaved files cancelled the operation.');
-  }
-
-  for (const item of dirty) {
-    const saved = await item.document.save();
-
-    if (!saved) {
-      throw new Error(`Could not save ${item.relativePath}`);
-    }
-  }
+    .filter(value => value && value !== '.');
 }
 
 async function chooseContextFiles(
@@ -129,46 +88,76 @@ async function chooseContextFiles(
   files,
   configuration
 ) {
-  if (files.length === 0) {
-    return [];
-  }
-
   const activePath = vscode.window.activeTextEditor
     ? repositoryPath(
         repositoryRoot,
         vscode.window.activeTextEditor.document.uri.fsPath
       )
     : undefined;
-  const items = files
-    .slice(0, configuration.maxFilePickerEntries)
-    .map(file => ({
+  const candidates = [...new Set([
+    ...files,
+    ...openRepositoryDocumentPaths(repositoryRoot),
+    ...(activePath && activePath !== '.' ? [activePath] : [])
+  ])]
+    .sort((left, right) => left.localeCompare(right))
+    .slice(0, configuration.maxFilePickerEntries);
+
+  if (candidates.length === 0) return [];
+
+  if (
+    candidates.length === 1 &&
+    configuration.autoIncludeActiveFile &&
+    candidates[0] === activePath
+  ) {
+    return [activePath];
+  }
+
+  const selected = await vscode.window.showQuickPick(
+    candidates.map(file => ({
       label: file,
-      picked: file === activePath
-    }));
-  const selected = await vscode.window.showQuickPick(items, {
-    title: 'Duo Agent: choose complete context files',
-    placeHolder:
-      'Select every existing file Duo may replace or delete.',
-    canPickMany: true,
-    ignoreFocusOut: true
-  });
+      picked:
+        configuration.autoIncludeActiveFile && file === activePath
+    })),
+    {
+      title: 'Duo Agent: choose files GitLab Duo should read',
+      placeHolder:
+        'The active file is preselected. Add any existing file Duo may edit or need for context.',
+      canPickMany: true,
+      ignoreFocusOut: true
+    }
+  );
 
   if (!selected) {
     throw new Error('Context selection cancelled.');
   }
 
-  return selected
-    .map(item => item.label)
-    .slice(0, configuration.maxContextFiles);
+  const chosen = selected.map(item => item.label);
+
+  if (
+    configuration.autoIncludeActiveFile &&
+    activePath &&
+    activePath !== '.' &&
+    !chosen.some(value => pathKey(value) === pathKey(activePath))
+  ) {
+    chosen.unshift(activePath);
+  }
+
+  return [...new Set(chosen)].slice(0, configuration.maxContextFiles);
 }
 
-function decodeUtf8(bytes, file) {
+function decodeContext(bytes, file) {
+  const source =
+    bytes.length >= 3 &&
+    bytes[0] === 0xef &&
+    bytes[1] === 0xbb &&
+    bytes[2] === 0xbf
+      ? bytes.subarray(3)
+      : bytes;
+
   try {
-    return UTF8_DECODER.decode(bytes);
+    return UTF8_DECODER.decode(source);
   } catch {
-    throw new Error(
-      `Context file is not valid UTF-8 text: ${file}`
-    );
+    throw new Error(`Context file is not valid UTF-8 text: ${file}`);
   }
 }
 
@@ -183,29 +172,13 @@ async function readContext(
   let totalCharacters = 0;
 
   for (const file of files) {
-    await requireNoSymlinkTraversal(repositoryRoot, file);
+    const state = await readFileState(repositoryRoot, file);
 
-    const absolutePath = path.join(
-      repositoryRoot,
-      ...file.split('/')
-    );
-    const stat = await fs.lstat(absolutePath);
-
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error(
-        `Context path is not a regular file: ${file}`
-      );
+    if (!state.exists) {
+      throw new Error(`Context file no longer exists: ${file}`);
     }
 
-    const bytes = await fs.readFile(absolutePath);
-
-    if (bytes.includes(0)) {
-      throw new Error(
-        `Binary context file is not supported: ${file}`
-      );
-    }
-
-    const content = decodeUtf8(bytes, file);
+    const content = decodeContext(state.bytes, file);
 
     if (content.length > configuration.maxCharactersPerFile) {
       throw new Error(
@@ -222,17 +195,18 @@ async function readContext(
       );
     }
 
-    const sha256 = sha256Buffer(bytes);
     totalCharacters += content.length;
     snapshots.push({
       path: file,
-      sha256,
-      size: bytes.length
+      sha256: state.sha256,
+      size: state.bytes.length,
+      wasDirty: state.wasDirty
     });
     chunks.push(
       `FILE_CONTEXT_BEGIN ${requestId}\n` +
         `PATH: ${file}\n` +
-        `SHA256: ${sha256}\n` +
+        `SHA256: ${state.sha256}\n` +
+        `SOURCE: ${state.wasDirty ? 'UNSAVED_EDITOR_BUFFER' : 'FILE'}\n` +
         `CONTENT_BEGIN ${requestId}\n${content}\n` +
         `CONTENT_END ${requestId}\n` +
         `FILE_CONTEXT_END ${requestId}`
@@ -250,13 +224,14 @@ async function readContext(
       repositoryRoot,
       editor.document.uri.fsPath
     );
+    const alreadyFullContext = files.some(
+      file => pathKey(file) === pathKey(relativePath ?? '')
+    );
 
-    if (relativePath && relativePath !== '.') {
+    if (relativePath && relativePath !== '.' && !alreadyFullContext) {
       const selection = editor.document.getText(editor.selection);
 
-      if (
-        selection.length > configuration.maxCharactersPerFile
-      ) {
+      if (selection.length > configuration.maxCharactersPerFile) {
         throw new Error(
           'Active selection exceeds duoAgent.maxCharactersPerFile.'
         );
@@ -267,7 +242,7 @@ async function readContext(
         configuration.maxContextCharacters
       ) {
         throw new Error(
-          'Full-file context plus the active selection exceeds ' +
+          'Selected files plus the active selection exceed ' +
             'duoAgent.maxContextCharacters.'
         );
       }
@@ -288,17 +263,24 @@ async function readContext(
   };
 }
 
+async function ensureSameBranch(pending) {
+  const branch = await currentBranch(pending.repositoryRoot);
+
+  if ((pending.branchAtRequest ?? '') !== branch) {
+    throw new Error(
+      'The current Git branch changed while GitLab Duo was responding. ' +
+        'Run the task again on this branch.'
+    );
+  }
+}
+
 async function applyFromClipboard(context) {
   if (!vscode.workspace.isTrusted) {
-    throw new Error(
-      'Trust the workspace before applying Duo Agent changes.'
-    );
+    throw new Error('Trust the workspace before applying changes.');
   }
 
   if (applyingResponse) {
-    throw new Error(
-      'A Duo Agent response is already being validated or applied.'
-    );
+    throw new Error('A GitLab Duo response is already being processed.');
   }
 
   applyingResponse = true;
@@ -308,30 +290,15 @@ async function applyFromClipboard(context) {
 
     if (!pending) {
       throw new Error(
-        'No pending Duo Agent request. Run ' +
-          'Duo Agent: Run Reviewed Task first.'
+        'There is no pending task. Run “Duo Agent: Run Code Task” first.'
       );
     }
+
+    await ensureSameBranch(pending);
 
     const configuration = getConfiguration(
       vscode.Uri.file(pending.repositoryRoot)
     );
-
-    await saveDirtyDocuments(pending.repositoryRoot);
-    await requireClean(
-      pending.repositoryRoot,
-      configuration
-    );
-
-    const currentHead = await requireHead(pending.repositoryRoot);
-
-    if (pending.baseCommit && currentHead !== pending.baseCommit) {
-      throw new Error(
-        'The repository HEAD changed after this task was sent to ' +
-          'GitLab Duo. Run a new task with the current revision.'
-      );
-    }
-
     const response = extractResponse(
       await vscode.env.clipboard.readText(),
       pending.requestId,
@@ -339,16 +306,9 @@ async function applyFromClipboard(context) {
     );
 
     if (response.noChanges) {
-      const document = await vscode.workspace.openTextDocument({
-        language: 'json',
-        content: response.body
-      });
-
-      await vscode.window.showTextDocument(document, {
-        preview: true
-      });
+      log(`GitLab Duo returned no changes: ${response.reason}`);
       vscode.window.showWarningMessage(
-        `GitLab Duo returned no changes: ${response.reason}`
+        `GitLab Duo could not produce changes: ${response.reason}`
       );
       return;
     }
@@ -362,25 +322,25 @@ async function applyFromClipboard(context) {
     const approved = await previewPlan(prepared);
 
     if (!approved) {
-      throw new Error('Operation plan application cancelled.');
+      vscode.window.showInformationMessage('No files were changed.');
+      return;
     }
 
     if (
       prepared.operations.some(operation => operation.op === 'delete')
     ) {
       const typed = await vscode.window.showInputBox({
-        title: 'Confirm deletion',
+        title: 'Confirm file deletion',
         prompt:
-          'The reviewed JSON plan deletes files. Type DELETE to continue.',
+          'The reviewed changes delete one or more files. Type DELETE to continue.',
         ignoreFocusOut: true,
         validateInput: value =>
-          value === 'DELETE'
-            ? undefined
-            : 'Type DELETE exactly.'
+          value === 'DELETE' ? undefined : 'Type DELETE exactly.'
       });
 
       if (typed !== 'DELETE') {
-        throw new Error('Deletion was not confirmed.');
+        vscode.window.showInformationMessage('No files were changed.');
+        return;
       }
     }
 
@@ -407,9 +367,7 @@ async function waitForCopiedResponse(
   while (Date.now() - started < limit) {
     const pending = context.workspaceState.get(PENDING_KEY);
 
-    if (!pending || pending.requestId !== requestId) {
-      return;
-    }
+    if (!pending || pending.requestId !== requestId) return;
 
     const clipboard = await vscode.env.clipboard.readText();
 
@@ -420,10 +378,7 @@ async function waitForCopiedResponse(
         configuration.maxResponseBytes
       )
     ) {
-      if (applyingResponse) {
-        return;
-      }
-
+      if (applyingResponse) return;
       await applyFromClipboard(context);
       return;
     }
@@ -432,36 +387,62 @@ async function waitForCopiedResponse(
   }
 
   vscode.window.showWarningMessage(
-    'Duo Agent timed out waiting for the copied JSON response. ' +
-      'Copy it and run “Duo Agent: Apply Pending JSON Response ' +
-      'from Clipboard”.'
+    'Duo Agent stopped waiting for the copied response. Copy the response ' +
+      'and run “Duo Agent: Apply Copied Response”.'
   );
+}
+
+function taskMayDelete(task) {
+  return /\b(delete|remove|obsolete|cleanup|clean up|drop)\b/i.test(task);
+}
+
+async function chooseDeletePermission(task) {
+  if (!taskMayDelete(task)) return false;
+
+  const choice = await vscode.window.showQuickPick(
+    [
+      {
+        label: 'Do not allow deletion',
+        description: 'Duo may create and replace files only',
+        value: false
+      },
+      {
+        label: 'Allow deletion for this task',
+        description: 'A second DELETE confirmation is still required',
+        value: true
+      }
+    ],
+    {
+      title: 'This task may require deleting files',
+      ignoreFocusOut: true
+    }
+  );
+
+  if (!choice) {
+    throw new Error('Deletion choice cancelled.');
+  }
+
+  return choice.value;
 }
 
 async function runTask(extensionContext) {
   if (!vscode.workspace.isTrusted) {
-    throw new Error(
-      'Trust the workspace before running Duo Agent.'
-    );
+    throw new Error('Trust the workspace before running Duo Agent.');
   }
 
-  const outputChannel = getOutput();
-  outputChannel.clear();
-  outputChannel.show(true);
+  const output = getOutput();
+  output.clear();
 
   const folder = await chooseWorkspaceFolder();
   const repositoryRoot = await resolveRepositoryRoot(folder);
   const configuration = getConfiguration(folder.uri);
-  const baseCommit = await requireHead(repositoryRoot);
-
-  await saveDirtyDocuments(repositoryRoot);
-  await requireClean(repositoryRoot, configuration);
+  const branchAtRequest = await currentBranch(repositoryRoot);
 
   const task = await vscode.window.showInputBox({
-    title: 'Duo Agent: task',
-    prompt: 'Describe what GitLab Duo should implement.',
+    title: 'Duo Agent: describe the code change',
+    prompt: 'Describe what GitLab Duo should create or modify.',
     placeHolder:
-      'Create a validator and tests. Preserve public APIs.',
+      'Refactor trial.py and add input validation without changing its public behavior.',
     ignoreFocusOut: true,
     validateInput: value =>
       value.trim().length >= 10
@@ -478,77 +459,47 @@ async function runTask(extensionContext) {
   const activeRelativePath = activeAbsolutePath
     ? repositoryPath(repositoryRoot, activeAbsolutePath)
     : undefined;
-  const suggestedPath =
+  const suggestedScope =
     activeRelativePath && activeRelativePath !== '.'
-      ? path.posix.dirname(activeRelativePath)
+      ? activeRelativePath
       : configuration.defaultAllowedPaths.join(', ');
   const writableInput = await vscode.window.showInputBox({
-    title: 'Duo Agent: writable paths',
+    title: 'Duo Agent: files or folders that may change',
     prompt:
-      'Comma-separated repository-relative paths. Use . only ' +
-      'for a controlled test repository.',
-    value:
-      suggestedPath === '.'
-        ? configuration.defaultAllowedPaths.join(', ')
-        : suggestedPath,
+      'Use repository-relative paths separated by commas. The active file is suggested for safety.',
+    value: suggestedScope,
     ignoreFocusOut: true
   });
 
   if (writableInput === undefined) {
-    throw new Error('Writable path entry cancelled.');
+    throw new Error('Writable scope entry cancelled.');
   }
 
   const allowedPaths = parseAllowedPaths(writableInput);
 
   if (allowedPaths.includes('.')) {
     const broadApproval = await vscode.window.showWarningMessage(
-      'The writable scope includes the entire repository. GitLab Duo ' +
-        'may propose changes to any non-protected path.',
-      { modal: true },
+      'The writable scope includes the entire repository.',
+      {
+        modal: true,
+        detail:
+          'GitLab Duo may propose changes to any non-protected text file.'
+      },
       'Allow Entire Repository'
     );
 
     if (broadApproval !== 'Allow Entire Repository') {
-      throw new Error(
-        'Entire-repository write access was not approved.'
-      );
+      throw new Error('Entire-repository access was not approved.');
     }
   }
 
-  const deletion = await vscode.window.showQuickPick(
-    [
-      {
-        label: 'No',
-        description: 'Reject JSON operations that delete files',
-        value: false
-      },
-      {
-        label: 'Yes',
-        description:
-          'Allow deletion after an additional DELETE confirmation',
-        value: true
-      }
-    ],
-    {
-      title: 'Can GitLab Duo delete files for this task?',
-      ignoreFocusOut: true
-    }
-  );
-
-  if (!deletion) {
-    throw new Error('Deletion choice cancelled.');
-  }
-
-  const allFiles = await trackedFiles(
+  const allowDelete = await chooseDeletePermission(task);
+  const allFiles = await repositoryFiles(
     repositoryRoot,
     Math.max(
       configuration.maxTreeEntries,
       configuration.maxFilePickerEntries
     )
-  );
-  const inventory = allFiles.slice(
-    0,
-    configuration.maxTreeEntries
   );
   const contextFiles = await chooseContextFiles(
     repositoryRoot,
@@ -562,11 +513,17 @@ async function runTask(extensionContext) {
     configuration,
     requestId
   );
+  const inventory = [...new Set([
+    ...allFiles,
+    ...openRepositoryDocumentPaths(repositoryRoot)
+  ])]
+    .sort((left, right) => left.localeCompare(right))
+    .slice(0, configuration.maxTreeEntries);
   const prompt = buildMasterPrompt({
     requestId,
     task: task.trim(),
     allowedPaths,
-    allowDelete: deletion.value,
+    allowDelete,
     files: inventory,
     contextText: collected.contextText
   });
@@ -575,22 +532,28 @@ async function runTask(extensionContext) {
     requestId,
     task: task.trim(),
     repositoryRoot,
-    baseCommit,
+    branchAtRequest,
     allowedPaths,
     contextFiles,
     contextSnapshots: collected.snapshots,
-    allowDelete: deletion.value,
+    allowDelete,
     createdAt: new Date().toISOString()
   };
 
   await extensionContext.workspaceState.update(PENDING_KEY, pending);
   await extensionContext.workspaceState.update(LAST_PROMPT_KEY, prompt);
 
-  log(`Created JSON request ${requestId}`);
-  log(`Writable paths: ${allowedPaths.join(', ')}`);
+  const dirtyStatus = await statusSummary(repositoryRoot);
+  log(`Created request ${requestId}`);
+  log(`Current branch: ${branchAtRequest || '(detached or unborn)'}`);
+  log(`Writable scope: ${allowedPaths.join(', ')}`);
+  log(`Context files: ${contextFiles.join(', ') || '(none)'}`);
   log(
-    `Context files: ${contextFiles.join(', ') || '(none)'}`
+    dirtyStatus
+      ? 'Existing working changes detected and left in place.'
+      : 'No existing Git working changes detected.'
   );
+  log('Unsaved editor buffers are read directly; no save is required.');
 
   const possibleResponse = await sendToGitLab(prompt);
 
@@ -604,8 +567,8 @@ async function runTask(extensionContext) {
   }
 
   vscode.window.showInformationMessage(
-    'Duo Agent sent the JSON master prompt. Click Copy Snippet on ' +
-      'the Duo response; the extension will detect it.'
+    'Prompt sent to GitLab Duo. When it finishes, click Copy Snippet on ' +
+      'the response. Duo Agent will open a review automatically.'
   );
 
   waitForCopiedResponse(
@@ -617,39 +580,34 @@ async function runTask(extensionContext) {
       ? error.message
       : String(error);
     log(`[ERROR] ${message}`);
+    getOutput().show(true);
     vscode.window.showErrorMessage(`Duo Agent: ${message}`);
   });
 }
 
 async function undoLastApply(context) {
   if (!vscode.workspace.isTrusted) {
-    throw new Error(
-      'Trust the workspace before restoring Duo Agent changes.'
-    );
+    throw new Error('Trust the workspace before restoring files.');
   }
 
-  await undoLastOperationPlan(context);
+  await undoLastFileChanges(context);
 }
 
 async function copyLastPrompt(context) {
   const prompt = context.workspaceState.get(LAST_PROMPT_KEY);
 
   if (!prompt) {
-    throw new Error(
-      'No previous Duo Agent master prompt was found.'
-    );
+    throw new Error('No previous generated prompt was found.');
   }
 
   await vscode.env.clipboard.writeText(prompt);
-  vscode.window.showInformationMessage(
-    'Copied the last Duo Agent master prompt.'
-  );
+  vscode.window.showInformationMessage('Copied the last generated prompt.');
 }
 
 async function verifyStaticSend() {
   await sendToGitLab(VERIFY_PROMPT);
   vscode.window.showInformationMessage(
-    'Sent static verification prompt. Expected: DUO_BRIDGE_OK'
+    'Sent the verification prompt. Expected response: DUO_BRIDGE_OK'
   );
 }
 
