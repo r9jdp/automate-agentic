@@ -1,25 +1,19 @@
 # Duo Agent
 
-Duo Agent is a local VS Code extension that turns a development task into a constrained master prompt, sends that prompt to GitLab Duo Quick Chat, validates the returned Git patch, and applies approved changes on a new local branch.
+Duo Agent is a local VS Code extension that turns a development request into a constrained master prompt, sends it to GitLab Duo Quick Chat, validates the copied JSON response, and applies approved text-file operations on a new local Git branch.
 
-It supports:
+Version `0.4.0` replaces the previous unified-diff workflow with a strict JSON operation protocol. GitLab Duo now returns complete final file contents, so the extension no longer depends on `git apply` matching exact patch context.
 
-- Dynamic task prompts
-- Repository file-tree context
-- User-selected context files
-- Active editor selection context
-- Restricted writable paths
-- File creation
-- File modification
-- Optional file deletion with an additional confirmation
-- Patch validation with `git apply --check`
-- Patch preview before application
-- A new local branch for every applied task
-- Prompt-injection boundaries around repository context
-- Reviewed saving of unsaved editor documents
-- Reversal of the last applied patch when branch history is unchanged
+## Supported operations
 
-It does not commit, push, open merge requests, execute generated shell commands, access browser cookies, call undocumented GitLab endpoints, or manipulate GitLab's webview DOM.
+- Create a new UTF-8 text file
+- Replace the complete contents of an existing UTF-8 text file
+- Delete an existing file when deletion was explicitly allowed
+- Preview all proposed changes before writing
+- Create a separate local branch for each applied task
+- Undo the last applied operation plan when no later edits or commits interfere
+
+Duo Agent does not commit, push, open merge requests, execute model-generated commands, manipulate GitLab's DOM, access browser cookies, or modify files outside the approved writable scope.
 
 ## Project structure
 
@@ -32,62 +26,14 @@ duo-bridge-poc/
 │   ├── git.js
 │   ├── paths.js
 │   ├── prompt.js
-│   ├── patch.js
+│   ├── operations.js
 │   └── workflow.js
+├── test/
+│   └── protocol.test.js
 └── README.md
 ```
 
-`extension.js` only registers commands. The `src` modules separate Git execution, path validation, master-prompt construction, patch validation/application, and the interactive workflow. There are no npm dependencies and no build step.
-
-## Workflow
-
-```text
-User task
-   |
-   v
-Duo Agent collects approved context
-   |
-   v
-Duo Agent builds a constrained master prompt
-   |
-   v
-GitLab Quick Chat receives the prompt automatically
-   |
-   v
-GitLab Duo produces one machine-readable Git patch
-   |
-   v
-User clicks Copy Snippet on the response
-   |
-   v
-Duo Agent detects the copied response
-   |
-   v
-Paths and patch structure are validated
-   |
-   v
-Patch is opened for review
-   |
-   v
-User approves application
-   |
-   v
-A new local branch is created and files are changed
-```
-
-## Why one Copy Snippet click is required
-
-The verified GitLab command can submit a prompt programmatically:
-
-```text
-gl.showAndSendDuoQuickChatWithContext
-```
-
-However, GitLab's command does not provide a documented response-reading API for another extension. VS Code also isolates one extension's comment UI and webviews from other extensions.
-
-Duo Agent therefore waits for the response to be copied through GitLab Quick Chat's existing **Copy Snippet** action. After that one click, validation, review, branch creation, and file application continue inside Duo Agent.
-
-The extension also inspects the return value of the GitLab command. If a future GitLab extension version returns response text directly, Duo Agent can consume it without the clipboard step.
+There are no npm dependencies and no build step.
 
 ## Requirements
 
@@ -99,21 +45,7 @@ The extension also inspects the return value of the GitLab command. If a future 
 - A trusted VS Code workspace
 - A clean Git working tree by default
 
-Check Git:
-
-```powershell
-git --version
-```
-
-Check the GitLab extension:
-
-```powershell
-code --list-extensions | Select-String -Pattern 'GitLab.gitlab-workflow'
-```
-
-## Run in the Extension Development Host
-
-Clone and open the extension:
+## Start the extension
 
 ```powershell
 git clone https://github.com/r9jdp/automate-agentic.git
@@ -121,287 +53,275 @@ cd automate-agentic\duo-bridge-poc
 code .
 ```
 
-No `npm install` command is required.
+If you already cloned it:
 
-In VS Code:
+```powershell
+git pull
+cd duo-bridge-poc
+code .
+```
 
-1. Press `F5`.
-2. A new **Extension Development Host** window opens.
-3. In that new window, open the **root folder** of the Git repository you want Duo Agent to modify. Do not open only a nested subfolder.
-4. Open a relevant source file.
-5. Confirm GitLab Duo Quick Chat works manually.
+Press `F5`. VS Code opens an **Extension Development Host** window.
+
+In that new window, open the **root directory** of the Git repository you want Duo Agent to modify. Do not open only a nested subdirectory.
 
 ## Run a task
 
-In the Extension Development Host:
-
-1. Press `Ctrl+Shift+P`.
-2. Run:
-
-   ```text
-   Duo Agent: Run Reviewed Task
-   ```
-
-3. Enter a precise development task.
-4. Confirm the repository-relative writable paths.
-5. Choose whether deletion is permitted.
-6. Select the files GitLab Duo should receive as full context.
-7. If files have unsaved changes, approve **Save All and Continue** or cancel.
-8. Wait for GitLab Duo Quick Chat to answer.
-9. Click **Copy Snippet** on the single response code block.
-10. Review the patch that Duo Agent opens.
-11. Select **Apply on New Branch** only after checking the paths and diff.
+1. Open a relevant source file.
+2. Press `Ctrl+Shift+P`.
+3. Run `Duo Agent: Run Reviewed Task`.
+4. Enter the development task.
+5. Enter the repository-relative writable paths.
+6. Choose whether deletion is allowed.
+7. Select complete context files.
+8. Wait for GitLab Duo to answer.
+9. Click **Copy Snippet** on the JSON response.
+10. Review the generated diff preview.
+11. Click **Apply on New Branch**.
 
 Example task:
 
 ```text
-Add email-address validation to customer creation. Preserve the public API,
-return the existing validation error type, and add unit tests for valid,
-invalid, blank, and null values.
+Replace trial.py with a function that prints odd numbers below a supplied limit.
+Preserve the existing entry point and add clear input validation.
 ```
 
-Example writable paths:
+Example writable path:
 
 ```text
-src/Validation, tests/Validation
+trial.py
 ```
 
-Use `.` only when the task genuinely requires permission to modify the entire repository.
-
-## Generated master-prompt contract
-
-Duo Agent asks GitLab Duo to return one response code block shaped like:
-
-```diff
-DUO_AGENT_REQUEST <request-id>
-diff --git a/src/example.js b/src/example.js
---- a/src/example.js
-+++ b/src/example.js
-@@ -1,2 +1,3 @@
- existing line
-+new line
-DUO_AGENT_END <request-id>
-```
-
-The request ID prevents a stale clipboard response from being applied to the wrong task. The master prompt also marks repository file contents, comments, filenames, and selections as untrusted data. Instructions embedded inside repository content are not authoritative and must not change the task, writable scope, or output contract.
-
-If GitLab Duo lacks enough context, it is instructed to return:
+For a feature spanning multiple directories:
 
 ```text
-DUO_AGENT_REQUEST <request-id>
-DUO_AGENT_NO_CHANGES <request-id>
-REASON: <specific missing context>
-DUO_AGENT_END <request-id>
+src/validation, tests/validation
 ```
 
-## Safety validation
+Use `.` only in a controlled test repository when the task genuinely requires permission to modify the entire repository.
 
-Before changing files, Duo Agent checks:
+## Context-file selection is important
 
-- The response belongs to the current request ID
-- The response contains a Git unified diff
-- Patch size and operation count are within configured limits
-- Every path is repository-relative
-- Every path is inside the user-approved writable scope
-- No path reaches `.git`, `.hg`, or `.svn` metadata directories
-- No path escapes through `..`
-- Windows device names, alternate-data-stream syntax, and invalid Windows path forms are rejected on Windows
-- No path traverses an existing symbolic link or junction
-- The patch contains no binary changes
-- The patch contains no renames or copies
-- The patch creates no symbolic links or submodules
-- The patch contains no mode-only changes
-- Deletion was approved for the current task
-- `git apply --check` succeeds
-- The repository still has a valid `HEAD` commit
-- Unsaved documents are saved only after explicit approval
-- The working tree is still clean before application
+A new file can be created without existing-file context.
 
-The patch is then displayed as a `diff` document. Nothing is applied until the user selects **Apply on New Branch**.
+An existing file can be replaced or deleted only when you selected that complete file in the context picker. Duo Agent records the file's SHA-256 hash and includes it in the master prompt. GitLab Duo must return that exact hash in the JSON operation. The extension then verifies the current file still has the same hash before applying anything.
 
-If deletion is present, the user must additionally type:
+An active editor selection is supplementary context only. Selecting a few lines does not authorize replacement or deletion of the entire file.
+
+## JSON response protocol
+
+GitLab Duo is instructed to return exactly one `json` code block and no surrounding prose.
+
+Successful response:
+
+```json
+{
+  "protocol": "duo-agent-json-v1",
+  "requestId": "the-exact-request-id",
+  "summary": "Brief description of the changes",
+  "operations": [
+    {
+      "op": "create",
+      "path": "src/new-file.js",
+      "content": "Complete final UTF-8 file content\n"
+    },
+    {
+      "op": "replace",
+      "path": "src/existing-file.js",
+      "expectedSha256": "exact-hash-from-file-context",
+      "content": "Complete final UTF-8 replacement content\n"
+    },
+    {
+      "op": "delete",
+      "path": "src/obsolete-file.js",
+      "expectedSha256": "exact-hash-from-file-context"
+    }
+  ]
+}
+```
+
+Only required operations should be included.
+
+No-change response:
+
+```json
+{
+  "protocol": "duo-agent-json-v1",
+  "requestId": "the-exact-request-id",
+  "noChanges": true,
+  "reason": "Specific missing context or reason"
+}
+```
+
+The parser rejects comments, trailing commas, unknown fields, unsupported operation types, duplicate paths, stale request IDs, and malformed JSON.
+
+## What happens after Copy Snippet
+
+The extension polls the clipboard for the current request ID. When it detects a valid response, it automatically:
+
+1. Parses the JSON with `JSON.parse`.
+2. Validates the protocol and request ID.
+3. Validates every operation and path.
+4. Rechecks the current Git revision and working tree.
+5. Verifies SHA-256 hashes for existing files.
+6. Generates a review diff from the proposed complete file contents.
+7. Asks for explicit approval.
+8. Creates a new local branch.
+9. Writes, creates, or deletes files transactionally.
+10. Verifies the resulting file hashes.
+
+If clipboard monitoring times out, copy the JSON code block and run:
+
+```text
+Duo Agent: Apply Pending JSON Response from Clipboard
+```
+
+## File-writing behavior
+
+For `create`, the path must not exist. Parent directories are created automatically.
+
+For `replace`, the complete file is written. When `duoAgent.preserveExistingEol` is enabled, the extension preserves the existing file's dominant line ending and UTF-8 BOM.
+
+For `delete`, deletion must have been allowed when the task was started. After review, the extension also requires you to type:
 
 ```text
 DELETE
 ```
 
-## What happens after approval
+If any operation fails after the branch is created, Duo Agent attempts to roll back all operations already performed. If rollback restores a clean working tree, it returns to the original branch and removes the failed generated branch.
 
-Duo Agent creates a branch similar to:
+## Safety checks
 
-```text
-duo-agent/20260716163000-add-email-validation
-```
+Before writing, Duo Agent checks:
 
-It then applies the patch to the working tree.
-
-It does not stage, commit, or push the changes.
-
-Review the result:
-
-```powershell
-git status --short
-git diff
-git diff --check
-```
-
-Run the repository's normal tests and static checks before committing.
-
-Examples:
-
-```powershell
-dotnet test
-```
-
-```powershell
-npm test
-```
-
-```powershell
-pytest
-```
+- The workspace is trusted
+- The repository root is open in VS Code
+- The repository has a valid `HEAD` commit
+- The working tree is clean when configured
+- The response uses `duo-agent-json-v1`
+- The response request ID matches the pending task
+- Response and file sizes are within configured limits
+- Every path is repository-relative and in the approved writable scope
+- `.git`, `.hg`, and `.svn` paths are blocked
+- `..`, absolute paths, Windows device names, and invalid Windows path forms are blocked
+- Existing symbolic links and junctions are blocked
+- Every existing-file operation uses a selected full-file context hash
+- Current file hashes still match the captured context
+- Duplicate and parent/child-conflicting file operations are rejected
+- Only UTF-8 text content is accepted
+- The user reviews the generated diff before application
 
 ## Commands
 
 ### `Duo Agent: Run Reviewed Task`
 
-Starts the complete workflow: task input, scope selection, context selection, prompt sending, clipboard wait, validation, preview, and application.
+Starts the complete workflow.
 
-### `Duo Agent: Apply Pending Response from Clipboard`
+### `Duo Agent: Apply Pending JSON Response from Clipboard`
 
-Use this when automatic clipboard waiting was cancelled or timed out:
-
-1. Copy the complete GitLab Duo response code block.
-2. Run this command.
-
-The request ID must match the pending request.
+Parses and applies the copied JSON response for the current pending request.
 
 ### `Duo Agent: Copy Last Master Prompt`
 
-Copies the most recently generated master prompt. This is useful when GitLab Quick Chat was closed or the prompt must be sent again.
+Copies the latest generated master prompt so it can be resent to GitLab Duo.
 
-### `Duo Agent: Undo Last Applied Patch`
+### `Duo Agent: Undo Last Applied Operation Plan`
 
-Runs a reverse dry-run check and, after confirmation, reverses the last patch applied by Duo Agent.
-
-This changes only the working tree. It does not delete the generated branch or rewrite Git history. The command refuses to run from another branch or after new commits have changed the generated branch history.
+Restores files to their pre-apply state when you are still on the generated branch, no new commits exist, and the affected files have not been changed again.
 
 ### `Duo Agent: Verify GitLab Duo Static Send`
 
-Sends the original verification prompt:
+Sends:
 
 ```text
 Reply with exactly this text and nothing else: DUO_BRIDGE_OK
 ```
 
-## Settings
+## Review and commit
 
-Open VS Code Settings and search for `Duo Agent`.
+After a successful apply:
 
-Important settings:
-
-| Setting | Default | Purpose |
-|---|---:|---|
-| `duoAgent.requireCleanWorkingTree` | `true` | Refuse to operate when existing changes are present |
-| `duoAgent.defaultAllowedPaths` | `["."]` | Default writable scope when no active-file directory is available |
-| `duoAgent.maxContextFiles` | `12` | Maximum full files sent as context |
-| `duoAgent.maxContextCharacters` | `90000` | Combined full-file context limit |
-| `duoAgent.maxCharactersPerFile` | `24000` | Per-file or selection context limit |
-| `duoAgent.maxTreeEntries` | `500` | Tracked paths added to the prompt |
-| `duoAgent.maxPatchBytes` | `1000000` | Maximum accepted patch size |
-| `duoAgent.maxOperations` | `50` | Maximum changed-file diff sections |
-| `duoAgent.clipboardWaitSeconds` | `600` | Clipboard-wait timeout |
-
-## Troubleshooting
-
-### The command is not visible
-
-In the extension project window, press `F5`. Run Duo Agent commands in the newly opened Extension Development Host, not in the original window.
-
-### GitLab Duo opens but no prompt is sent
-
-Run:
-
-```text
-Duo Agent: Verify GitLab Duo Static Send
+```powershell
+git branch --show-current
+git status --short
+git diff
+git diff --check
 ```
 
-Open **View → Output** and select **Duo Agent**.
-
-The installed GitLab extension must register:
-
-```text
-gl.showAndSendDuoQuickChatWithContext
-```
-
-### The clipboard wait timed out
-
-Copy the complete response code block and run:
-
-```text
-Duo Agent: Apply Pending Response from Clipboard
-```
-
-### The response ID does not match
-
-The copied response belongs to an earlier task. Copy the response generated for the latest pending request, or rerun the task.
-
-### Git rejected the patch
-
-Likely causes:
-
-- GitLab Duo used stale file content
-- Too few context files were selected
-- The repository changed while Duo was responding
-- The copied code block was incomplete
-- GitLab Duo produced an invalid diff
-
-Regenerate the task with current and more relevant context files.
-
-### Open the repository root
-
-Error:
-
-```text
-Open the Git repository root as the VS Code workspace before running Duo Agent.
-```
-
-Close the current folder and open the folder that contains the repository's `.git` directory. This prevents the extension from modifying files outside the trusted VS Code workspace.
-
-### The repository has no commits
-
-Create an initial commit before running Duo Agent:
+Run the appropriate tests and static checks for the project, then commit manually:
 
 ```powershell
 git add .
-git commit -m "Initial commit"
+git commit -m "Implement requested change"
+git push -u origin HEAD
 ```
 
-### Unsaved files are detected
+## Settings
 
-Choose **Save All and Continue** to save the listed repository files, or cancel and review them manually. After saving, the normal clean-working-tree check still runs; saved changes must be committed, stashed, or discarded before the task continues.
+Search VS Code Settings for `Duo Agent`.
 
-### The working tree is not clean
+| Setting | Default | Purpose |
+|---|---:|---|
+| `duoAgent.requireCleanWorkingTree` | `true` | Refuse existing working-tree changes |
+| `duoAgent.defaultAllowedPaths` | `["."]` | Default writable scope |
+| `duoAgent.maxContextFiles` | `12` | Maximum complete context files |
+| `duoAgent.maxContextCharacters` | `90000` | Combined context-character limit |
+| `duoAgent.maxCharactersPerFile` | `24000` | Per-context-file character limit |
+| `duoAgent.maxResponseBytes` | `1000000` | Maximum copied JSON response size |
+| `duoAgent.maxFileWriteBytes` | `500000` | Maximum size of one created or replaced file |
+| `duoAgent.maxTotalWriteBytes` | `2000000` | Maximum total bytes written in one task |
+| `duoAgent.maxOperations` | `50` | Maximum file operations in one task |
+| `duoAgent.preserveExistingEol` | `true` | Preserve replacement-file EOL and BOM |
+| `duoAgent.clipboardWaitSeconds` | `600` | Clipboard monitoring timeout |
 
-Check:
+## Test the JSON protocol
+
+No installation is required:
+
+```powershell
+npm test
+```
+
+This tests valid create, replace, delete, and no-change responses, code-fence handling, stale request rejection, unknown fields, unsafe paths, and writable-scope matching.
+
+## Troubleshooting
+
+### Old patch-protocol request
+
+After upgrading from `0.3.x`, discard any pending old response and run a new task. Old unified-diff responses are intentionally rejected.
+
+### Copy Snippet does not continue
+
+Open **View → Output** and select **Duo Agent**. Then run:
+
+```text
+Duo Agent: Apply Pending JSON Response from Clipboard
+```
+
+The most common cause is invalid JSON or a response for an older request.
+
+### Invalid JSON
+
+Ask GitLab Duo to regenerate exactly one JSON code block with:
+
+- Double-quoted keys and strings
+- Escaped newlines inside `content`
+- No comments
+- No trailing commas
+- No prose outside the code block
+
+### Existing file was not supplied as complete context
+
+Run the task again and select that full file in the context picker.
+
+### File changed after context was collected
+
+The file changed while GitLab Duo was responding. Commit, stash, or discard the change, then run a new task.
+
+### Working tree is not clean
 
 ```powershell
 git status --short
 ```
 
-Commit, stash, or remove existing work before rerunning Duo Agent.
-
-## Current scope
-
-This version deliberately uses a reviewed Git-patch workflow. It does not yet:
-
-- Automatically read another extension's private UI state
-- Execute tests automatically
-- Retry GitLab Duo with compiler errors
-- Commit or push changes
-- Create merge requests
-- Run arbitrary commands proposed by the model
-- Apply binary assets
-- Perform renames, copies, symlinks, or submodule changes
-
-These boundaries keep the first file-writing version inspectable and reversible. Repository context can contain hostile or misleading text, so the generated master prompt treats that context as data and all returned patches still require structural validation and human approval.
+Commit, stash, or discard existing work before rerunning Duo Agent.
