@@ -21,6 +21,7 @@ function register(commandId, handler) {
     } catch (error) {
       const message = errorText(error);
       log(`[ERROR] ${message}`);
+      getOutput().show(true);
       vscode.window.showErrorMessage(`Duo Agent: ${message}`);
     }
   });
