@@ -81,7 +81,7 @@ function normalizeRepositoryPath(value, options = {}) {
 }
 
 function parseAllowedPaths(input) {
-  const paths = String(input)
+  const values = String(input)
     .split(',')
     .map(value => value.trim())
     .filter(Boolean)
@@ -89,11 +89,11 @@ function parseAllowedPaths(input) {
       normalizeRepositoryPath(value, { allowRoot: true })
     );
 
-  if (paths.length === 0) {
+  if (values.length === 0) {
     throw new Error('Provide at least one writable path.');
   }
 
-  return [...new Set(paths)];
+  return [...new Set(values)];
 }
 
 function pathKey(value) {
@@ -116,10 +116,7 @@ function isPathAllowed(relativePath, allowedPaths) {
   });
 }
 
-async function requireNoSymlinkTraversal(
-  repositoryRoot,
-  relativePath
-) {
+function absoluteRepositoryPath(repositoryRoot, relativePath) {
   const root = path.resolve(repositoryRoot);
   const target = path.resolve(
     root,
@@ -135,9 +132,22 @@ async function requireNoSymlinkTraversal(
     throw new Error(`Path escapes repository: ${relativePath}`);
   }
 
+  return target;
+}
+
+async function requireNoSymlinkTraversal(
+  repositoryRoot,
+  relativePath
+) {
+  const target = absoluteRepositoryPath(
+    repositoryRoot,
+    relativePath
+  );
+  const root = path.resolve(repositoryRoot);
+  const relative = path.relative(root, target);
   let current = root;
 
-  for (const segment of relativePath.split('/')) {
+  for (const segment of relative.split(path.sep)) {
     current = path.join(current, segment);
 
     try {
@@ -164,5 +174,6 @@ module.exports = {
   parseAllowedPaths,
   pathKey,
   isPathAllowed,
+  absoluteRepositoryPath,
   requireNoSymlinkTraversal
 };
