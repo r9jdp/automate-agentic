@@ -1,8 +1,8 @@
 {
   "name": "duo-bridge-poc",
   "displayName": "Duo Agent",
-  "description": "Builds constrained GitLab Duo prompts and safely applies reviewed JSON file-operation plans.",
-  "version": "0.4.0",
+  "description": "Turns GitLab Duo responses into reviewed file changes on the current branch without requiring a clean working tree.",
+  "version": "0.5.0",
   "private": true,
   "publisher": "local",
   "engines": {
@@ -36,44 +36,39 @@
     "GitLab.gitlab-workflow"
   ],
   "scripts": {
-    "test": "node test/protocol.test.js"
+    "test": "node test/protocol.test.js && node test/operations.test.js"
   },
   "contributes": {
     "commands": [
       {
         "command": "duoAgent.runTask",
-        "title": "Run Reviewed Task",
+        "title": "Run Code Task",
         "category": "Duo Agent"
       },
       {
         "command": "duoAgent.applyClipboard",
-        "title": "Apply Pending JSON Response from Clipboard",
+        "title": "Apply Copied Response",
         "category": "Duo Agent"
       },
       {
         "command": "duoAgent.copyLastPrompt",
-        "title": "Copy Last Master Prompt",
+        "title": "Copy Last Generated Prompt",
         "category": "Duo Agent"
       },
       {
         "command": "duoAgent.undoLastApply",
-        "title": "Undo Last Applied Operation Plan",
+        "title": "Undo Last Changes",
         "category": "Duo Agent"
       },
       {
         "command": "duoBridge.verify",
-        "title": "Verify GitLab Duo Static Send",
+        "title": "Verify GitLab Duo Connection",
         "category": "Duo Agent"
       }
     ],
     "configuration": {
       "title": "Duo Agent",
       "properties": {
-        "duoAgent.requireCleanWorkingTree": {
-          "type": "boolean",
-          "default": true,
-          "description": "Require a clean Git working tree before generating or applying a file-operation plan."
-        },
         "duoAgent.defaultAllowedPaths": {
           "type": "array",
           "items": {
@@ -82,14 +77,19 @@
           "default": [
             "."
           ],
-          "description": "Default repository-relative writable paths. The active file directory is proposed first when available."
+          "description": "Default repository-relative writable paths when no active file is available."
+        },
+        "duoAgent.autoIncludeActiveFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically include the active file as complete context and preselect it in the file picker."
         },
         "duoAgent.maxContextFiles": {
           "type": "integer",
           "default": 12,
           "minimum": 0,
           "maximum": 50,
-          "description": "Maximum number of complete files included in a generated master prompt."
+          "description": "Maximum number of complete files included in a generated prompt."
         },
         "duoAgent.maxContextCharacters": {
           "type": "integer",
@@ -103,28 +103,28 @@
           "default": 24000,
           "minimum": 1000,
           "maximum": 100000,
-          "description": "Maximum characters included from any one context file or editor selection."
+          "description": "Maximum characters included from one context file or editor selection."
         },
         "duoAgent.maxTreeEntries": {
           "type": "integer",
           "default": 500,
           "minimum": 20,
           "maximum": 5000,
-          "description": "Maximum number of tracked repository paths included in the master prompt."
+          "description": "Maximum number of repository paths included in the generated prompt."
         },
         "duoAgent.maxFilePickerEntries": {
           "type": "integer",
           "default": 800,
           "minimum": 20,
           "maximum": 5000,
-          "description": "Maximum number of tracked files displayed in the context-file picker."
+          "description": "Maximum number of files displayed in the context picker."
         },
         "duoAgent.maxResponseBytes": {
           "type": "integer",
           "default": 1000000,
           "minimum": 1000,
           "maximum": 5000000,
-          "description": "Maximum UTF-8 size of a copied GitLab Duo JSON response."
+          "description": "Maximum UTF-8 size of a copied GitLab Duo response."
         },
         "duoAgent.maxFileWriteBytes": {
           "type": "integer",
@@ -138,14 +138,14 @@
           "default": 2000000,
           "minimum": 1,
           "maximum": 10000000,
-          "description": "Maximum combined UTF-8 bytes written by one reviewed operation plan."
+          "description": "Maximum combined UTF-8 bytes written by one reviewed task."
         },
         "duoAgent.maxOperations": {
           "type": "integer",
           "default": 50,
           "minimum": 1,
           "maximum": 200,
-          "description": "Maximum number of create, replace, or delete operations accepted in one response."
+          "description": "Maximum number of create, replace, or delete changes accepted in one response."
         },
         "duoAgent.preserveExistingEol": {
           "type": "boolean",
@@ -157,7 +157,7 @@
           "default": 600,
           "minimum": 30,
           "maximum": 3600,
-          "description": "How long the extension waits for the GitLab Duo JSON code block to be copied."
+          "description": "How long Duo Agent waits for the GitLab Duo response to be copied."
         }
       }
     }
