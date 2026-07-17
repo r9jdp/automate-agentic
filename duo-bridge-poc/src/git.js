@@ -89,55 +89,36 @@ async function resolveRepositoryRoot(folder) {
   return repositoryRoot;
 }
 
-async function requireHead(repositoryRoot) {
+async function currentBranch(repositoryRoot) {
+  const result = await git(
+    repositoryRoot,
+    ['branch', '--show-current'],
+    { allowFailure: true }
+  );
+
+  return result.stdout.trim();
+}
+
+async function currentHead(repositoryRoot) {
   const result = await git(
     repositoryRoot,
     ['rev-parse', '--verify', 'HEAD'],
     { allowFailure: true }
   );
 
-  if (result.exitCode !== 0 || !result.stdout.trim()) {
-    throw new Error(
-      'Repository must have at least one commit before Duo Agent ' +
-        'can create a branch.'
-    );
-  }
-
-  return result.stdout.trim();
+  return result.exitCode === 0 ? result.stdout.trim() : undefined;
 }
 
-async function currentBranch(repositoryRoot) {
+async function repositoryFiles(repositoryRoot, maximum) {
   const result = await git(
     repositoryRoot,
-    ['branch', '--show-current']
-  );
-
-  return result.stdout.trim();
-}
-
-async function requireClean(repositoryRoot, configuration) {
-  if (!configuration.requireCleanWorkingTree) {
-    return;
-  }
-
-  const result = await git(repositoryRoot, [
-    'status',
-    '--porcelain=v1',
-    '--untracked-files=all'
-  ]);
-
-  if (result.stdout.trim()) {
-    throw new Error(
-      'Git working tree is not clean. Commit, stash, or discard ' +
-        `existing changes.\n\n${result.stdout.trim()}`
-    );
-  }
-}
-
-async function trackedFiles(repositoryRoot, maximum) {
-  const result = await git(
-    repositoryRoot,
-    ['ls-files', '-z']
+    [
+      'ls-files',
+      '--cached',
+      '--others',
+      '--exclude-standard',
+      '-z'
+    ]
   );
 
   return result.stdout
@@ -145,14 +126,26 @@ async function trackedFiles(repositoryRoot, maximum) {
     .filter(Boolean)
     .map(file => file.replace(/\\/g, '/'))
     .filter(file => !file.startsWith('.git/'))
+    .sort((left, right) => left.localeCompare(right))
     .slice(0, maximum);
+}
+
+async function statusSummary(repositoryRoot) {
+  const result = await git(
+    repositoryRoot,
+    ['status', '--porcelain=v1', '--untracked-files=all'],
+    { allowFailure: true }
+  );
+
+  return result.stdout.trim();
 }
 
 module.exports = {
   git,
   resolveRepositoryRoot,
-  requireHead,
   currentBranch,
-  requireClean,
-  trackedFiles
+  currentHead,
+  repositoryFiles,
+  trackedFiles: repositoryFiles,
+  statusSummary
 };
