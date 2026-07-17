@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs/promises');
 const { createHash } = require('crypto');
+const { TextDecoder } = require('util');
 const {
   LAST_APPLY_KEY,
   PENDING_KEY,
@@ -12,9 +13,7 @@ const {
 } = require('./runtime');
 const {
   git,
-  requireHead,
-  currentBranch,
-  requireClean
+  currentBranch
 } = require('./git');
 const {
   normalizeRepositoryPath,
@@ -23,9 +22,9 @@ const {
   requireNoSymlinkTraversal,
   pathKey
 } = require('./paths');
-const { branchSlug } = require('./prompt');
 
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 function sha256Buffer(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
@@ -40,20 +39,28 @@ function startsWithUtf8Bom(buffer) {
   );
 }
 
-function dominantEol(buffer) {
+function decodeUtf8(buffer, label) {
   const source = startsWithUtf8Bom(buffer)
     ? buffer.subarray(3)
     : buffer;
-  const text = source.toString('utf8');
+
+  try {
+    return UTF8_DECODER.decode(source);
+  } catch {
+    throw new Error(`File is not valid UTF-8 text: ${label}`);
+  }
+}
+
+function dominantEol(buffer) {
+  const text = decodeUtf8(buffer, 'replacement source');
   const crlf = (text.match(/\r\n/g) || []).length;
-  const withoutCrlf = text.replace(/\r\n/g, '');
-  const lf = (withoutCrlf.match(/\n/g) || []).length;
+  const lf = (text.replace(/\r\n/g, '').match(/\n/g) || []).length;
 
   return crlf > lf ? '\r\n' : '\n';
 }
 
 function encodeContent(content, original, preserveExistingEol) {
-  let normalized = content;
+  let normalized = String(content);
 
   if (original && preserveExistingEol) {
     normalized = normalized
@@ -78,6 +85,22 @@ function encodeContent(content, original, preserveExistingEol) {
   return bytes;
 }
 
+function normalizedFsPath(value) {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32'
+    ? resolved.toLowerCase()
+    : resolved;
+}
+
+function findOpenDocument(absolutePath) {
+  const expected = normalizedFsPath(absolutePath);
+
+  return vscode.workspace.textDocuments.find(document =>
+    document.uri.scheme === 'file' &&
+    normalizedFsPath(document.uri.fsPath) === expected
+  );
+}
+
 async function lstatIfExists(absolutePath) {
   try {
     return await fs.lstat(absolutePath);
@@ -90,6 +113,25 @@ async function lstatIfExists(absolutePath) {
   }
 }
 
+async function diskBytesIfExists(absolutePath, stat) {
+  if (!stat) return undefined;
+  return fs.readFile(absolutePath);
+}
+
+function documentBytes(document, diskBytes) {
+  let bytes = Buffer.from(document.getText(), 'utf8');
+
+  if (
+    diskBytes &&
+    startsWithUtf8Bom(diskBytes) &&
+    !startsWithUtf8Bom(bytes)
+  ) {
+    bytes = Buffer.concat([UTF8_BOM, bytes]);
+  }
+
+  return bytes;
+}
+
 async function readFileState(repositoryRoot, relativePath) {
   await requireNoSymlinkTraversal(repositoryRoot, relativePath);
 
@@ -99,20 +141,31 @@ async function readFileState(repositoryRoot, relativePath) {
   );
   const stat = await lstatIfExists(absolutePath);
 
-  if (!stat) {
-    return {
-      exists: false,
-      absolutePath
-    };
-  }
-
-  if (stat.isSymbolicLink() || !stat.isFile()) {
+  if (stat && (stat.isSymbolicLink() || !stat.isFile())) {
     throw new Error(
-      `Operation target is not a regular file: ${relativePath}`
+      `File-change target is not a regular file: ${relativePath}`
     );
   }
 
-  const bytes = await fs.readFile(absolutePath);
+  const diskBytes = await diskBytesIfExists(absolutePath, stat);
+  const document = findOpenDocument(absolutePath);
+
+  if (!stat && !document) {
+    return {
+      exists: false,
+      absolutePath,
+      diskExists: false,
+      wasDirty: false
+    };
+  }
+
+  const bytes = document
+    ? documentBytes(document, diskBytes)
+    : diskBytes;
+
+  if (!bytes) {
+    throw new Error(`Could not read file state: ${relativePath}`);
+  }
 
   if (bytes.includes(0)) {
     throw new Error(
@@ -120,12 +173,17 @@ async function readFileState(repositoryRoot, relativePath) {
     );
   }
 
+  decodeUtf8(bytes, relativePath);
+
   return {
     exists: true,
     absolutePath,
+    diskExists: Boolean(stat),
     bytes,
-    mode: stat.mode & 0o777,
-    sha256: sha256Buffer(bytes)
+    mode: stat ? stat.mode & 0o777 : undefined,
+    sha256: sha256Buffer(bytes),
+    document,
+    wasDirty: Boolean(document?.isDirty)
   };
 }
 
@@ -137,9 +195,7 @@ async function requireSafeParents(repositoryRoot, relativePath) {
     current = path.join(current, segment);
     const stat = await lstatIfExists(current);
 
-    if (!stat) {
-      return;
-    }
+    if (!stat) return;
 
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new Error(
@@ -154,7 +210,8 @@ function snapshotMap(pending) {
 
   if (!Array.isArray(snapshots)) {
     throw new Error(
-      'This pending request uses the old patch protocol. Run a new task.'
+      'This pending request is from an older extension version. ' +
+        'Run a new task.'
     );
   }
 
@@ -177,8 +234,7 @@ function detectPathConflicts(operations) {
 
     if (next.startsWith(`${current}/`)) {
       throw new Error(
-        `Conflicting file paths in operation plan: ` +
-          `${sorted[index]} and ${sorted[index + 1]}`
+        `Conflicting file paths: ${sorted[index]} and ${sorted[index + 1]}`
       );
     }
   }
@@ -191,13 +247,13 @@ async function validatePlan(
   configuration
 ) {
   if (plan.requestId !== pending.requestId) {
-    throw new Error('Operation plan request ID does not match pending task.');
+    throw new Error('The copied response does not match the pending task.');
   }
 
   if (plan.operations.length > configuration.maxOperations) {
     throw new Error(
-      `Operation plan contains ${plan.operations.length} operations; ` +
-        `configured maximum is ${configuration.maxOperations}.`
+      `The response contains ${plan.operations.length} file changes; ` +
+        `the configured maximum is ${configuration.maxOperations}.`
     );
   }
 
@@ -212,7 +268,7 @@ async function validatePlan(
 
     if (seen.has(key)) {
       throw new Error(
-        `Operation plan changes the same path more than once: ${relativePath}`
+        `The response changes the same path more than once: ${relativePath}`
       );
     }
 
@@ -220,7 +276,7 @@ async function validatePlan(
 
     if (!isPathAllowed(relativePath, pending.allowedPaths)) {
       throw new Error(
-        `Operation path is outside writable scope: ${relativePath}`
+        `File is outside the approved writable scope: ${relativePath}`
       );
     }
 
@@ -229,14 +285,12 @@ async function validatePlan(
 
     if (raw.op === 'create') {
       if (before.exists) {
-        throw new Error(
-          `create target already exists: ${relativePath}`
-        );
+        throw new Error(`File already exists: ${relativePath}`);
       }
 
       if (raw.content.includes('\0')) {
         throw new Error(
-          `create content contains a NUL character: ${relativePath}`
+          `New file content contains a NUL character: ${relativePath}`
         );
       }
 
@@ -263,7 +317,8 @@ async function validatePlan(
 
     if (!snapshot) {
       throw new Error(
-        `Existing file was not supplied as complete context: ${relativePath}`
+        `Select the complete existing file as context and run again: ` +
+          relativePath
       );
     }
 
@@ -272,19 +327,17 @@ async function validatePlan(
 
     if (expected !== snapshotHash) {
       throw new Error(
-        `expectedSha256 does not match supplied context for ${relativePath}`
+        `GitLab Duo returned the wrong file version for ${relativePath}.`
       );
     }
 
     if (!before.exists) {
-      throw new Error(
-        `${raw.op} target no longer exists: ${relativePath}`
-      );
+      throw new Error(`${relativePath} no longer exists.`);
     }
 
     if (before.sha256 !== expected) {
       throw new Error(
-        `File changed after context was collected: ${relativePath}`
+        `${relativePath} changed after the prompt was sent. Run the task again.`
       );
     }
 
@@ -292,6 +345,12 @@ async function validatePlan(
       if (!pending.allowDelete) {
         throw new Error(
           `Deletion was not allowed for this task: ${relativePath}`
+        );
+      }
+
+      if (before.document?.isDirty) {
+        throw new Error(
+          `Close or save the unsaved file before deleting it: ${relativePath}`
         );
       }
 
@@ -307,7 +366,7 @@ async function validatePlan(
 
     if (raw.content.includes('\0')) {
       throw new Error(
-        `replace content contains a NUL character: ${relativePath}`
+        `Replacement content contains a NUL character: ${relativePath}`
       );
     }
 
@@ -327,7 +386,7 @@ async function validatePlan(
 
     if (afterSha256 === before.sha256) {
       throw new Error(
-        `replace operation makes no effective change: ${relativePath}`
+        `The proposed replacement makes no change: ${relativePath}`
       );
     }
 
@@ -388,7 +447,7 @@ function normalizePreviewDiff(diff) {
 
 async function buildReviewDocument(prepared) {
   const temporaryRoot = await fs.mkdtemp(
-    path.join(os.tmpdir(), 'duo-agent-json-review-')
+    path.join(os.tmpdir(), 'duo-agent-review-')
   );
   const beforeRoot = path.join(temporaryRoot, 'before');
   const afterRoot = path.join(temporaryRoot, 'after');
@@ -433,14 +492,13 @@ async function buildReviewDocument(prepared) {
 
     if (![0, 1].includes(result.exitCode)) {
       throw new Error(
-        `Could not build review diff.\n${result.stderr || result.stdout}`
+        `Could not build the review diff.\n${result.stderr || result.stdout}`
       );
     }
 
     const summary = [
-      `# Duo Agent JSON operation plan`,
-      `# Request: ${prepared.requestId}`,
-      `# Summary: ${prepared.summary}`,
+      '# Duo Agent proposed file changes',
+      `# ${prepared.summary}`,
       ...prepared.operations.map(operation =>
         `# ${operation.op.toUpperCase()} ${operation.path}`
       ),
@@ -469,21 +527,64 @@ async function previewPlan(prepared) {
   });
 
   const details = prepared.operations
-    .map(operation =>
-      `${operation.op.toUpperCase()} ${operation.path}`
-    )
+    .map(operation => `${operation.op.toUpperCase()} ${operation.path}`)
     .join('\n');
   const approval = await vscode.window.showWarningMessage(
-    `Apply ${prepared.operations.length} reviewed file operation(s) ` +
-      'on a new branch?',
+    `Apply ${prepared.operations.length} proposed file change(s) ` +
+      'to the current branch?',
     {
       modal: true,
       detail: details
     },
-    'Apply on New Branch'
+    'Apply Changes'
   );
 
-  return approval === 'Apply on New Branch';
+  return approval === 'Apply Changes';
+}
+
+async function replaceDocument(document, bytes, saveAfter) {
+  const text = decodeUtf8(bytes, document.uri.fsPath);
+  const edit = new vscode.WorkspaceEdit();
+  const fullRange = new vscode.Range(
+    document.positionAt(0),
+    document.positionAt(document.getText().length)
+  );
+
+  edit.replace(document.uri, fullRange, text);
+
+  const applied = await vscode.workspace.applyEdit(edit);
+
+  if (!applied) {
+    throw new Error(`VS Code rejected the edit for ${document.uri.fsPath}`);
+  }
+
+  if (saveAfter) {
+    const saved = await document.save();
+
+    if (!saved) {
+      throw new Error(`Could not save ${document.uri.fsPath}`);
+    }
+  }
+}
+
+async function writeBytes(operation, bytes, saveAfter) {
+  const document = findOpenDocument(operation.before.absolutePath);
+
+  if (document) {
+    await replaceDocument(document, bytes, saveAfter);
+  } else {
+    await fs.mkdir(path.dirname(operation.before.absolutePath), {
+      recursive: true
+    });
+    await fs.writeFile(operation.before.absolutePath, bytes);
+  }
+
+  if (operation.before.mode !== undefined) {
+    await fs.chmod(
+      operation.before.absolutePath,
+      operation.before.mode
+    ).catch(() => undefined);
+  }
 }
 
 async function removeEmptyParents(repositoryRoot, startDirectory) {
@@ -501,24 +602,14 @@ async function removeEmptyParents(repositoryRoot, startDirectory) {
   }
 }
 
-async function writeReplacement(operation) {
-  await fs.mkdir(path.dirname(operation.before.absolutePath), {
-    recursive: true
-  });
-  await fs.writeFile(operation.before.absolutePath, operation.afterBytes);
-
-  if (operation.before.mode !== undefined) {
-    await fs.chmod(operation.before.absolutePath, operation.before.mode);
-  }
-}
-
 async function applyOne(operation) {
-  const target = operation.before.absolutePath;
   operation.writeStarted = false;
 
   if (operation.op === 'create') {
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    const handle = await fs.open(target, 'wx');
+    await fs.mkdir(path.dirname(operation.before.absolutePath), {
+      recursive: true
+    });
+    const handle = await fs.open(operation.before.absolutePath, 'wx');
     operation.writeStarted = true;
 
     try {
@@ -528,10 +619,14 @@ async function applyOne(operation) {
     }
   } else if (operation.op === 'replace') {
     operation.writeStarted = true;
-    await writeReplacement(operation);
+    await writeBytes(
+      operation,
+      operation.afterBytes,
+      !operation.before.wasDirty
+    );
   } else {
     operation.writeStarted = true;
-    await fs.unlink(target);
+    await fs.unlink(operation.before.absolutePath);
   }
 }
 
@@ -559,17 +654,13 @@ async function verifyOperationResult(repositoryRoot, operation) {
 
   if (operation.op === 'delete') {
     if (state.exists) {
-      throw new Error(
-        `Delete verification failed: ${operation.path}`
-      );
+      throw new Error(`Delete verification failed: ${operation.path}`);
     }
     return;
   }
 
   if (!state.exists || state.sha256 !== operation.afterSha256) {
-    throw new Error(
-      `Write verification failed: ${operation.path}`
-    );
+    throw new Error(`Write verification failed: ${operation.path}`);
   }
 }
 
@@ -578,20 +669,20 @@ async function rollbackApplied(repositoryRoot, applied) {
 
   for (const operation of [...applied].reverse()) {
     try {
-      const target = absoluteRepositoryPath(
-        repositoryRoot,
-        operation.path
-      );
-
       if (operation.before.exists) {
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        await fs.writeFile(target, operation.before.bytes);
-        await fs.chmod(target, operation.before.mode);
+        await writeBytes(
+          operation,
+          operation.before.bytes,
+          !operation.before.wasDirty
+        );
       } else {
-        await fs.unlink(target).catch(error => {
+        await fs.unlink(operation.before.absolutePath).catch(error => {
           if (!error || error.code !== 'ENOENT') throw error;
         });
-        await removeEmptyParents(repositoryRoot, path.dirname(target));
+        await removeEmptyParents(
+          repositoryRoot,
+          path.dirname(operation.before.absolutePath)
+        );
       }
     } catch (error) {
       errors.push(
@@ -615,11 +706,7 @@ async function saveUndoBackup(context, payload) {
       `${payload.requestId}.json`
     );
     await fs.mkdir(directory, { recursive: true });
-    await fs.writeFile(
-      backupPath,
-      JSON.stringify(payload),
-      'utf8'
-    );
+    await fs.writeFile(backupPath, JSON.stringify(payload), 'utf8');
     return { backupPath };
   }
 
@@ -628,18 +715,12 @@ async function saveUndoBackup(context, payload) {
 
 async function loadUndoBackup(last) {
   if (last.backupPath) {
-    return JSON.parse(
-      await fs.readFile(last.backupPath, 'utf8')
-    );
+    return JSON.parse(await fs.readFile(last.backupPath, 'utf8'));
   }
 
-  if (last.inlineBackup) {
-    return last.inlineBackup;
-  }
+  if (last.inlineBackup) return last.inlineBackup;
 
-  throw new Error(
-    'The saved undo information uses an older incompatible format.'
-  );
+  throw new Error('No compatible undo information was found.');
 }
 
 async function deleteUndoBackup(last) {
@@ -661,27 +742,14 @@ async function applyPlan(
     pending,
     configuration
   );
-  const baseCommit = await requireHead(repositoryRoot);
+  const branch = await currentBranch(repositoryRoot);
 
-  if (pending.baseCommit && baseCommit !== pending.baseCommit) {
+  if ((pending.branchAtRequest ?? '') !== branch) {
     throw new Error(
-      'The repository HEAD changed after this task was created. ' +
-        'Run the task again with the current revision.'
+      'The current Git branch changed while GitLab Duo was responding. ' +
+        'Run the task again on this branch.'
     );
   }
-
-  await requireClean(repositoryRoot, configuration);
-
-  const originalBranch = await currentBranch(repositoryRoot);
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[-:TZ.]/g, '')
-    .slice(0, 14);
-  const branch =
-    `duo-agent/${timestamp}-${branchSlug(pending.task)}-` +
-    pending.requestId.slice(0, 8);
-
-  await git(repositoryRoot, ['switch', '-c', branch]);
 
   const applied = [];
 
@@ -701,41 +769,10 @@ async function applyPlan(
       }
     }
   } catch (error) {
-    const rollbackErrors = await rollbackApplied(
-      repositoryRoot,
-      applied
-    );
-    const status = await git(
-      repositoryRoot,
-      ['status', '--porcelain=v1', '--untracked-files=all'],
-      { allowFailure: true }
-    );
-
-    if (!status.stdout.trim()) {
-      if (originalBranch) {
-        await git(
-          repositoryRoot,
-          ['switch', originalBranch],
-          { allowFailure: true }
-        );
-      } else {
-        await git(
-          repositoryRoot,
-          ['switch', '--detach', baseCommit],
-          { allowFailure: true }
-        );
-      }
-
-      await git(
-        repositoryRoot,
-        ['branch', '-D', branch],
-        { allowFailure: true }
-      );
-    }
-
+    const rollbackErrors = await rollbackApplied(repositoryRoot, applied);
     const rollbackMessage = rollbackErrors.length
       ? `\nRollback errors:\n${rollbackErrors.join('\n')}`
-      : '\nApplied operations were rolled back.';
+      : '\nApplied file changes were rolled back.';
 
     throw new Error(
       `${error instanceof Error ? error.message : String(error)}` +
@@ -744,11 +781,10 @@ async function applyPlan(
   }
 
   const backupPayload = {
-    version: 1,
+    version: 2,
     requestId: pending.requestId,
     repositoryRoot,
     branch,
-    baseCommit,
     operations: applied.map(operation => ({
       path: operation.path,
       beforeExists: operation.before.exists,
@@ -756,6 +792,7 @@ async function applyPlan(
         ? operation.before.bytes.toString('base64')
         : undefined,
       beforeMode: operation.before.mode,
+      beforeWasDirty: operation.before.wasDirty,
       afterExists: operation.op !== 'delete',
       afterSha256: operation.afterSha256
     }))
@@ -773,7 +810,6 @@ async function applyPlan(
       requestId: pending.requestId,
       repositoryRoot,
       branch,
-      baseCommit,
       changedPaths: applied.map(operation => operation.path),
       appliedAt: new Date().toISOString(),
       ...backupReference
@@ -782,7 +818,7 @@ async function applyPlan(
     undoSaved = true;
   } catch (error) {
     log(
-      `[ERROR] Changes were applied but undo metadata could not be saved: ${
+      `[ERROR] Changes were applied but undo data could not be saved: ${
         error instanceof Error ? error.message : String(error)
       }`
     );
@@ -790,40 +826,26 @@ async function applyPlan(
 
   await context.workspaceState.update(PENDING_KEY, undefined);
 
+  const branchLabel = branch || 'the current checkout';
   const suffix = undoSaved
-    ? 'The Undo Last Applied Operation Plan command is available.'
-    : 'Automatic undo is unavailable; use Git to discard changes if needed.';
+    ? 'You can use “Duo Agent: Undo Last Changes”.'
+    : 'Use Git or editor undo if you need to revert them.';
 
   vscode.window.showInformationMessage(
-    `Duo Agent applied ${applied.length} operation(s) on branch ` +
-      `${branch}. Review git diff before committing. ${suffix}`
+    `Applied ${applied.length} file change(s) on ${branchLabel}. ` +
+      `Unrelated working changes were left untouched. ${suffix}`
   );
-}
-
-function parseStatusPaths(stdout) {
-  const entries = [];
-
-  for (const record of stdout.split('\0').filter(Boolean)) {
-    if (record.length < 4) continue;
-
-    entries.push({
-      indexStatus: record[0],
-      workTreeStatus: record[1],
-      path: record.slice(3).replace(/\\/g, '/')
-    });
-  }
-
-  return entries;
 }
 
 async function verifyUndoState(repositoryRoot, backup) {
   for (const operation of backup.operations) {
-    const state = await readFileState(repositoryRoot, operation.path);
+    const relativePath = normalizeRepositoryPath(operation.path);
+    const state = await readFileState(repositoryRoot, relativePath);
 
     if (!operation.afterExists) {
       if (state.exists) {
         throw new Error(
-          `Deleted file was recreated after apply: ${operation.path}`
+          `Cannot undo because this path now exists: ${relativePath}`
         );
       }
       continue;
@@ -831,154 +853,92 @@ async function verifyUndoState(repositoryRoot, backup) {
 
     if (!state.exists || state.sha256 !== operation.afterSha256) {
       throw new Error(
-        `File changed after Duo Agent applied it: ${operation.path}`
+        `Cannot undo because this file changed again: ${relativePath}`
       );
     }
   }
 }
 
-async function restoreBeforeState(repositoryRoot, operation) {
-  const target = absoluteRepositoryPath(repositoryRoot, operation.path);
+async function restoreBackupOperation(repositoryRoot, operation) {
+  const relativePath = normalizeRepositoryPath(operation.path);
+  const absolutePath = absoluteRepositoryPath(repositoryRoot, relativePath);
 
   if (!operation.beforeExists) {
-    await fs.unlink(target).catch(error => {
+    await fs.unlink(absolutePath).catch(error => {
       if (!error || error.code !== 'ENOENT') throw error;
     });
-    await removeEmptyParents(repositoryRoot, path.dirname(target));
+    await removeEmptyParents(repositoryRoot, path.dirname(absolutePath));
     return;
   }
 
   const bytes = Buffer.from(operation.beforeContentBase64, 'base64');
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, bytes);
+  const before = {
+    absolutePath,
+    mode: operation.beforeMode,
+    wasDirty: Boolean(operation.beforeWasDirty)
+  };
 
-  if (operation.beforeMode !== undefined) {
-    await fs.chmod(target, operation.beforeMode);
-  }
+  await writeBytes(
+    { before },
+    bytes,
+    !before.wasDirty
+  );
 }
 
 async function undoLastApply(context) {
   const last = context.workspaceState.get(LAST_APPLY_KEY);
 
   if (!last) {
-    throw new Error('No last applied Duo Agent plan was found.');
+    throw new Error('There are no Duo Agent changes to undo.');
   }
 
   const backup = await loadUndoBackup(last);
   const branch = await currentBranch(last.repositoryRoot);
 
-  if (branch !== last.branch) {
+  if ((backup.branch ?? '') !== branch) {
     throw new Error(
-      `Switch to ${last.branch} before undoing the last apply.`
-    );
-  }
-
-  const head = (
-    await git(last.repositoryRoot, ['rev-parse', 'HEAD'])
-  ).stdout.trim();
-
-  if (head !== last.baseCommit) {
-    throw new Error(
-      'The generated branch has new commits. Undo manually with Git.'
-    );
-  }
-
-  const status = await git(last.repositoryRoot, [
-    'status',
-    '--porcelain=v1',
-    '-z',
-    '--untracked-files=all'
-  ]);
-  const expected = new Set(
-    backup.operations.map(operation => pathKey(operation.path))
-  );
-  const unrelated = [];
-  const staged = [];
-
-  for (const entry of parseStatusPaths(status.stdout)) {
-    if (!expected.has(pathKey(entry.path))) {
-      unrelated.push(entry.path);
-    }
-
-    if (entry.indexStatus !== ' ' && entry.indexStatus !== '?') {
-      staged.push(entry.path);
-    }
-  }
-
-  if (unrelated.length > 0) {
-    throw new Error(
-      'Unrelated working-tree changes prevent automatic undo:\n' +
-        unrelated.join('\n')
-    );
-  }
-
-  if (staged.length > 0) {
-    throw new Error(
-      'Unstage these files before automatic undo:\n' +
-        [...new Set(staged)].join('\n')
+      `Switch back to ${backup.branch || 'the original checkout'} ` +
+        'before undoing these changes.'
     );
   }
 
   await verifyUndoState(last.repositoryRoot, backup);
 
   const approval = await vscode.window.showWarningMessage(
-    `Undo the last Duo Agent operation plan on ${last.branch}?`,
+    `Undo ${backup.operations.length} Duo Agent file change(s) ` +
+      'on the current branch?',
     { modal: true },
-    'Undo'
+    'Undo Changes'
   );
 
-  if (approval !== 'Undo') {
-    return;
-  }
-
-  const currentStates = [];
-
-  for (const operation of backup.operations) {
-    currentStates.push({
-      operation,
-      state: await readFileState(last.repositoryRoot, operation.path)
-    });
-  }
+  if (approval !== 'Undo Changes') return;
 
   const restored = [];
 
   try {
     for (const operation of [...backup.operations].reverse()) {
-      await restoreBeforeState(last.repositoryRoot, operation);
+      await restoreBackupOperation(last.repositoryRoot, operation);
       restored.push(operation.path);
     }
   } catch (error) {
-    log('[ERROR] Undo failed; attempting to restore post-apply state.');
-
-    for (const item of currentStates) {
-      const target = absoluteRepositoryPath(
-        last.repositoryRoot,
-        item.operation.path
-      );
-
-      if (item.state.exists) {
-        await fs.mkdir(path.dirname(target), { recursive: true });
-        await fs.writeFile(target, item.state.bytes);
-        await fs.chmod(target, item.state.mode);
-      } else {
-        await fs.unlink(target).catch(() => undefined);
-      }
-    }
-
-    throw error;
+    throw new Error(
+      `Undo stopped after restoring ${restored.length} file(s): ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
 
-  void restored;
-  await context.workspaceState.update(LAST_APPLY_KEY, undefined);
   await deleteUndoBackup(last);
+  await context.workspaceState.update(LAST_APPLY_KEY, undefined);
 
   vscode.window.showInformationMessage(
-    'Duo Agent restored the files to their pre-apply state.'
+    'Duo Agent restored the files to their previous contents.'
   );
 }
 
 module.exports = {
   sha256Buffer,
+  readFileState,
   validatePlan,
   previewPlan,
   applyPlan,
