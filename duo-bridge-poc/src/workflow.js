@@ -4,6 +4,7 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs/promises');
 const { randomUUID } = require('crypto');
+const { TextDecoder } = require('util');
 const {
   VERIFY_PROMPT,
   PENDING_KEY,
@@ -31,13 +32,14 @@ const {
   clipboardContainsResponse
 } = require('./prompt');
 const {
-  patchDeletesFile,
-  validatePatch,
-  previewPatch,
-  applyPatch,
-  undoLastApply: undoLastApplyPatch
-} = require('./patch');
+  sha256Buffer,
+  validatePlan,
+  previewPlan,
+  applyPlan,
+  undoLastApply: undoLastOperationPlan
+} = require('./operations');
 
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 let applyingResponse = false;
 
 async function chooseWorkspaceFolder() {
@@ -144,9 +146,9 @@ async function chooseContextFiles(
       picked: file === activePath
     }));
   const selected = await vscode.window.showQuickPick(items, {
-    title: 'Duo Agent: choose context files for GitLab Duo',
+    title: 'Duo Agent: choose complete context files',
     placeHolder:
-      'Select files Duo should read. Writable scope is separate.',
+      'Select every existing file Duo may replace or delete.',
     canPickMany: true,
     ignoreFocusOut: true
   });
@@ -160,6 +162,16 @@ async function chooseContextFiles(
     .slice(0, configuration.maxContextFiles);
 }
 
+function decodeUtf8(bytes, file) {
+  try {
+    return UTF8_DECODER.decode(bytes);
+  } catch {
+    throw new Error(
+      `Context file is not valid UTF-8 text: ${file}`
+    );
+  }
+}
+
 async function readContext(
   repositoryRoot,
   files,
@@ -167,6 +179,7 @@ async function readContext(
   requestId
 ) {
   const chunks = [];
+  const snapshots = [];
   let totalCharacters = 0;
 
   for (const file of files) {
@@ -192,11 +205,9 @@ async function readContext(
       );
     }
 
-    const content = bytes.toString('utf8');
+    const content = decodeUtf8(bytes, file);
 
-    if (
-      content.length > configuration.maxCharactersPerFile
-    ) {
+    if (content.length > configuration.maxCharactersPerFile) {
       throw new Error(
         `${file} exceeds duoAgent.maxCharactersPerFile.`
       );
@@ -211,9 +222,17 @@ async function readContext(
       );
     }
 
+    const sha256 = sha256Buffer(bytes);
     totalCharacters += content.length;
+    snapshots.push({
+      path: file,
+      sha256,
+      size: bytes.length
+    });
     chunks.push(
-      `FILE_CONTEXT_BEGIN ${requestId}\nPATH: ${file}\n` +
+      `FILE_CONTEXT_BEGIN ${requestId}\n` +
+        `PATH: ${file}\n` +
+        `SHA256: ${sha256}\n` +
         `CONTENT_BEGIN ${requestId}\n${content}\n` +
         `CONTENT_END ${requestId}\n` +
         `FILE_CONTEXT_END ${requestId}`
@@ -253,7 +272,6 @@ async function readContext(
         );
       }
 
-      totalCharacters += selection.length;
       chunks.push(
         `ACTIVE_SELECTION_BEGIN ${requestId}\n` +
           `PATH: ${relativePath}\n${selection}\n` +
@@ -262,10 +280,12 @@ async function readContext(
     }
   }
 
-  return (
-    chunks.join('\n\n') ||
-    'No full file context was selected.'
-  );
+  return {
+    contextText:
+      chunks.join('\n\n') ||
+      'No complete file context was selected.',
+    snapshots
+  };
 }
 
 async function applyFromClipboard(context) {
@@ -304,6 +324,7 @@ async function applyFromClipboard(context) {
     );
 
     const currentHead = await requireHead(pending.repositoryRoot);
+
     if (pending.baseCommit && currentHead !== pending.baseCommit) {
       throw new Error(
         'The repository HEAD changed after this task was sent to ' +
@@ -313,12 +334,13 @@ async function applyFromClipboard(context) {
 
     const response = extractResponse(
       await vscode.env.clipboard.readText(),
-      pending.requestId
+      pending.requestId,
+      configuration.maxResponseBytes
     );
 
     if (response.noChanges) {
       const document = await vscode.workspace.openTextDocument({
-        language: 'text',
+        language: 'json',
         content: response.body
       });
 
@@ -326,33 +348,30 @@ async function applyFromClipboard(context) {
         preview: true
       });
       vscode.window.showWarningMessage(
-        'GitLab Duo returned DUO_AGENT_NO_CHANGES. ' +
-          'The pending request was kept.'
+        `GitLab Duo returned no changes: ${response.reason}`
       );
       return;
     }
 
-    const changedPaths = await validatePatch(
+    const prepared = await validatePlan(
       pending.repositoryRoot,
-      response.patch,
+      response.plan,
       pending,
       configuration
     );
-
-    const approved = await previewPatch(
-      response.patch,
-      changedPaths
-    );
+    const approved = await previewPlan(prepared);
 
     if (!approved) {
-      throw new Error('Patch application cancelled.');
+      throw new Error('Operation plan application cancelled.');
     }
 
-    if (patchDeletesFile(response.patch)) {
+    if (
+      prepared.operations.some(operation => operation.op === 'delete')
+    ) {
       const typed = await vscode.window.showInputBox({
         title: 'Confirm deletion',
         prompt:
-          'The reviewed patch deletes files. Type DELETE to continue.',
+          'The reviewed JSON plan deletes files. Type DELETE to continue.',
         ignoreFocusOut: true,
         validateInput: value =>
           value === 'DELETE'
@@ -365,11 +384,10 @@ async function applyFromClipboard(context) {
       }
     }
 
-    await applyPatch(
+    await applyPlan(
       pending.repositoryRoot,
-      response.patch,
+      response.plan,
       pending,
-      changedPaths,
       context,
       configuration
     );
@@ -381,10 +399,10 @@ async function applyFromClipboard(context) {
 async function waitForCopiedResponse(
   context,
   requestId,
-  seconds
+  configuration
 ) {
   const started = Date.now();
-  const limit = seconds * 1000;
+  const limit = configuration.clipboardWaitSeconds * 1000;
 
   while (Date.now() - started < limit) {
     const pending = context.workspaceState.get(PENDING_KEY);
@@ -395,7 +413,13 @@ async function waitForCopiedResponse(
 
     const clipboard = await vscode.env.clipboard.readText();
 
-    if (clipboardContainsResponse(clipboard, requestId)) {
+    if (
+      clipboardContainsResponse(
+        clipboard,
+        requestId,
+        configuration.maxResponseBytes
+      )
+    ) {
       if (applyingResponse) {
         return;
       }
@@ -408,13 +432,13 @@ async function waitForCopiedResponse(
   }
 
   vscode.window.showWarningMessage(
-    'Duo Agent timed out waiting for the copied response. ' +
-      'Copy it and run “Duo Agent: Apply Pending Response ' +
+    'Duo Agent timed out waiting for the copied JSON response. ' +
+      'Copy it and run “Duo Agent: Apply Pending JSON Response ' +
       'from Clipboard”.'
   );
 }
 
-async function runTask(context) {
+async function runTask(extensionContext) {
   if (!vscode.workspace.isTrusted) {
     throw new Error(
       'Trust the workspace before running Duo Agent.'
@@ -428,8 +452,8 @@ async function runTask(context) {
   const folder = await chooseWorkspaceFolder();
   const repositoryRoot = await resolveRepositoryRoot(folder);
   const configuration = getConfiguration(folder.uri);
-
   const baseCommit = await requireHead(repositoryRoot);
+
   await saveDirtyDocuments(repositoryRoot);
   await requireClean(repositoryRoot, configuration);
 
@@ -495,7 +519,7 @@ async function runTask(context) {
     [
       {
         label: 'No',
-        description: 'Reject patches that delete files',
+        description: 'Reject JSON operations that delete files',
         value: false
       },
       {
@@ -532,7 +556,7 @@ async function runTask(context) {
     configuration
   );
   const requestId = randomUUID();
-  const contextText = await readContext(
+  const collected = await readContext(
     repositoryRoot,
     contextFiles,
     configuration,
@@ -544,23 +568,25 @@ async function runTask(context) {
     allowedPaths,
     allowDelete: deletion.value,
     files: inventory,
-    contextText
+    contextText: collected.contextText
   });
   const pending = {
+    protocol: 'duo-agent-json-v1',
     requestId,
     task: task.trim(),
     repositoryRoot,
     baseCommit,
     allowedPaths,
     contextFiles,
+    contextSnapshots: collected.snapshots,
     allowDelete: deletion.value,
     createdAt: new Date().toISOString()
   };
 
-  await context.workspaceState.update(PENDING_KEY, pending);
-  await context.workspaceState.update(LAST_PROMPT_KEY, prompt);
+  await extensionContext.workspaceState.update(PENDING_KEY, pending);
+  await extensionContext.workspaceState.update(LAST_PROMPT_KEY, prompt);
 
-  log(`Created request ${requestId}`);
+  log(`Created JSON request ${requestId}`);
   log(`Writable paths: ${allowedPaths.join(', ')}`);
   log(
     `Context files: ${contextFiles.join(', ') || '(none)'}`
@@ -570,29 +596,28 @@ async function runTask(context) {
 
   if (
     typeof possibleResponse === 'string' &&
-    possibleResponse.includes(`DUO_AGENT_REQUEST ${requestId}`)
+    possibleResponse.includes(requestId)
   ) {
     await vscode.env.clipboard.writeText(possibleResponse);
-    await applyFromClipboard(context);
+    await applyFromClipboard(extensionContext);
     return;
   }
 
   vscode.window.showInformationMessage(
-    'Duo Agent sent the master prompt. Click Copy Snippet on ' +
+    'Duo Agent sent the JSON master prompt. Click Copy Snippet on ' +
       'the Duo response; the extension will detect it.'
   );
 
   waitForCopiedResponse(
-    context,
+    extensionContext,
     requestId,
-    configuration.clipboardWaitSeconds
+    configuration
   ).catch(error => {
-    log(`[ERROR] ${error instanceof Error ? error.message : String(error)}`);
-    vscode.window.showErrorMessage(
-      `Duo Agent: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
+    const message = error instanceof Error
+      ? error.message
+      : String(error);
+    log(`[ERROR] ${message}`);
+    vscode.window.showErrorMessage(`Duo Agent: ${message}`);
   });
 }
 
@@ -603,7 +628,7 @@ async function undoLastApply(context) {
     );
   }
 
-  await undoLastApplyPatch(context);
+  await undoLastOperationPlan(context);
 }
 
 async function copyLastPrompt(context) {
@@ -616,7 +641,6 @@ async function copyLastPrompt(context) {
   }
 
   await vscode.env.clipboard.writeText(prompt);
-
   vscode.window.showInformationMessage(
     'Copied the last Duo Agent master prompt.'
   );
@@ -624,7 +648,6 @@ async function copyLastPrompt(context) {
 
 async function verifyStaticSend() {
   await sendToGitLab(VERIFY_PROMPT);
-
   vscode.window.showInformationMessage(
     'Sent static verification prompt. Expected: DUO_BRIDGE_OK'
   );
