@@ -14,7 +14,7 @@ const {
   verifyStaticSend
 } = require('./src/workflow');
 
-function register(context, commandId, handler) {
+function register(commandId, handler) {
   return vscode.commands.registerCommand(commandId, async () => {
     try {
       await handler();
@@ -29,17 +29,17 @@ function register(context, commandId, handler) {
 function activate(context) {
   context.subscriptions.push(
     getOutput(),
-    register(context, 'duoAgent.runTask', () => runTask(context)),
-    register(context, 'duoAgent.applyClipboard', () =>
+    register('duoAgent.runTask', () => runTask(context)),
+    register('duoAgent.applyClipboard', () =>
       applyFromClipboard(context)
     ),
-    register(context, 'duoAgent.copyLastPrompt', () =>
+    register('duoAgent.copyLastPrompt', () =>
       copyLastPrompt(context)
     ),
-    register(context, 'duoAgent.undoLastApply', () =>
+    register('duoAgent.undoLastApply', () =>
       undoLastApply(context)
     ),
-    register(context, 'duoBridge.verify', verifyStaticSend)
+    register('duoBridge.verify', verifyStaticSend)
   );
 }
 
