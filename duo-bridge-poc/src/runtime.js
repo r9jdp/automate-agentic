@@ -45,13 +45,13 @@ function getConfiguration(resource) {
   );
 
   return {
-    requireCleanWorkingTree: configuration.get(
-      'requireCleanWorkingTree',
-      true
-    ),
     defaultAllowedPaths: configuration.get(
       'defaultAllowedPaths',
       ['.']
+    ),
+    autoIncludeActiveFile: configuration.get(
+      'autoIncludeActiveFile',
+      true
     ),
     maxContextFiles: configuration.get('maxContextFiles', 12),
     maxContextCharacters: configuration.get(
@@ -149,8 +149,8 @@ async function sendToGitLab(prompt) {
   await vscode.commands.executeCommand(openCommand);
 
   vscode.window.showWarningMessage(
-    `GitLab did not expose ${GITLAB_SEND_COMMAND}. ` +
-      'The master prompt was copied; paste it into Quick Chat.'
+    'GitLab Quick Chat opened, but automatic sending is unavailable. ' +
+      'The generated prompt is on your clipboard.'
   );
 
   return undefined;
