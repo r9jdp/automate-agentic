@@ -67,8 +67,23 @@ function getConfiguration(resource) {
       'maxFilePickerEntries',
       800
     ),
-    maxPatchBytes: configuration.get('maxPatchBytes', 1000000),
+    maxResponseBytes: configuration.get(
+      'maxResponseBytes',
+      1000000
+    ),
+    maxFileWriteBytes: configuration.get(
+      'maxFileWriteBytes',
+      500000
+    ),
+    maxTotalWriteBytes: configuration.get(
+      'maxTotalWriteBytes',
+      2000000
+    ),
     maxOperations: configuration.get('maxOperations', 50),
+    preserveExistingEol: configuration.get(
+      'preserveExistingEol',
+      true
+    ),
     clipboardWaitSeconds: configuration.get(
       'clipboardWaitSeconds',
       600
