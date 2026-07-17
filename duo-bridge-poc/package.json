@@ -1,8 +1,8 @@
 {
   "name": "duo-bridge-poc",
   "displayName": "Duo Agent",
-  "description": "Builds reviewed code-change prompts for GitLab Duo Quick Chat and safely applies validated Git patches.",
-  "version": "0.3.0",
+  "description": "Builds constrained GitLab Duo prompts and safely applies reviewed JSON file-operation plans.",
+  "version": "0.4.0",
   "private": true,
   "publisher": "local",
   "engines": {
@@ -35,6 +35,9 @@
   "extensionDependencies": [
     "GitLab.gitlab-workflow"
   ],
+  "scripts": {
+    "test": "node test/protocol.test.js"
+  },
   "contributes": {
     "commands": [
       {
@@ -44,7 +47,7 @@
       },
       {
         "command": "duoAgent.applyClipboard",
-        "title": "Apply Pending Response from Clipboard",
+        "title": "Apply Pending JSON Response from Clipboard",
         "category": "Duo Agent"
       },
       {
@@ -54,7 +57,7 @@
       },
       {
         "command": "duoAgent.undoLastApply",
-        "title": "Undo Last Applied Patch",
+        "title": "Undo Last Applied Operation Plan",
         "category": "Duo Agent"
       },
       {
@@ -69,7 +72,7 @@
         "duoAgent.requireCleanWorkingTree": {
           "type": "boolean",
           "default": true,
-          "description": "Require a clean Git working tree before generating or applying a patch."
+          "description": "Require a clean Git working tree before generating or applying a file-operation plan."
         },
         "duoAgent.defaultAllowedPaths": {
           "type": "array",
@@ -86,7 +89,7 @@
           "default": 12,
           "minimum": 0,
           "maximum": 50,
-          "description": "Maximum number of full files that can be included in a generated master prompt."
+          "description": "Maximum number of complete files included in a generated master prompt."
         },
         "duoAgent.maxContextCharacters": {
           "type": "integer",
@@ -116,26 +119,45 @@
           "maximum": 5000,
           "description": "Maximum number of tracked files displayed in the context-file picker."
         },
-        "duoAgent.maxPatchBytes": {
+        "duoAgent.maxResponseBytes": {
           "type": "integer",
           "default": 1000000,
           "minimum": 1000,
           "maximum": 5000000,
-          "description": "Maximum UTF-8 size of a GitLab Duo patch accepted by the extension."
+          "description": "Maximum UTF-8 size of a copied GitLab Duo JSON response."
+        },
+        "duoAgent.maxFileWriteBytes": {
+          "type": "integer",
+          "default": 500000,
+          "minimum": 1,
+          "maximum": 5000000,
+          "description": "Maximum UTF-8 size of one created or replaced text file."
+        },
+        "duoAgent.maxTotalWriteBytes": {
+          "type": "integer",
+          "default": 2000000,
+          "minimum": 1,
+          "maximum": 10000000,
+          "description": "Maximum combined UTF-8 bytes written by one reviewed operation plan."
         },
         "duoAgent.maxOperations": {
           "type": "integer",
           "default": 50,
           "minimum": 1,
           "maximum": 200,
-          "description": "Maximum number of file diff sections accepted in one response."
+          "description": "Maximum number of create, replace, or delete operations accepted in one response."
+        },
+        "duoAgent.preserveExistingEol": {
+          "type": "boolean",
+          "default": true,
+          "description": "Preserve the dominant line ending and UTF-8 BOM of replaced files."
         },
         "duoAgent.clipboardWaitSeconds": {
           "type": "integer",
           "default": 600,
           "minimum": 30,
           "maximum": 3600,
-          "description": "How long the extension waits for the GitLab Duo response code block to be copied."
+          "description": "How long the extension waits for the GitLab Duo JSON code block to be copied."
         }
       }
     }
