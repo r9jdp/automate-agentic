@@ -53,10 +53,23 @@ function getConfiguration(resource) {
       'autoIncludeActiveFile',
       true
     ),
+    maxContextPoolFiles: configuration.get(
+      'maxContextPoolFiles',
+      100
+    ),
     maxContextFiles: configuration.get('maxContextFiles', 12),
     maxContextCharacters: configuration.get(
       'maxContextCharacters',
-      90000
+      45000
+    ),
+    maxPromptCharacters: configuration.get(
+      'maxPromptCharacters',
+      60000
+    ),
+    maxContextRounds: configuration.get('maxContextRounds', 3),
+    targetResponseCharacters: configuration.get(
+      'targetResponseCharacters',
+      24000
     ),
     maxCharactersPerFile: configuration.get(
       'maxCharactersPerFile',

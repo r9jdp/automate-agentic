@@ -22,10 +22,12 @@ const {
 } = require('./git');
 const {
   repositoryPath,
+  normalizeRepositoryPath,
   parseAllowedPaths,
   pathKey
 } = require('./paths');
 const {
+  PROTOCOL,
   buildMasterPrompt,
   extractResponse,
   clipboardContainsResponse
@@ -37,6 +39,11 @@ const {
   applyPlan,
   undoLastApply: undoLastFileChanges
 } = require('./operations');
+const {
+  rankContextFiles,
+  buildContextCatalog,
+  contextLimitReason
+} = require('./context');
 
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 let applyingResponse = false;
@@ -83,7 +90,7 @@ function openRepositoryDocumentPaths(repositoryRoot) {
     .filter(value => value && value !== '.');
 }
 
-async function chooseContextFiles(
+async function chooseContextPool(
   repositoryRoot,
   files,
   configuration
@@ -94,15 +101,25 @@ async function chooseContextFiles(
         vscode.window.activeTextEditor.document.uri.fsPath
       )
     : undefined;
-  const candidates = [...new Set([
+  const allCandidates = [...new Set([
     ...files,
     ...openRepositoryDocumentPaths(repositoryRoot),
     ...(activePath && activePath !== '.' ? [activePath] : [])
   ])]
-    .sort((left, right) => left.localeCompare(right))
-    .slice(0, configuration.maxFilePickerEntries);
+    .sort((left, right) => left.localeCompare(right));
+  const candidates = allCandidates.slice(
+    0,
+    configuration.maxFilePickerEntries
+  );
 
   if (candidates.length === 0) return [];
+
+  if (allCandidates.length > candidates.length) {
+    vscode.window.showInformationMessage(
+      `Duo Agent is showing the first ${candidates.length} files because ` +
+        'of duoAgent.maxFilePickerEntries.'
+    );
+  }
 
   if (
     candidates.length === 1 &&
@@ -112,37 +129,50 @@ async function chooseContextFiles(
     return [activePath];
   }
 
-  const selected = await vscode.window.showQuickPick(
-    candidates.map(file => ({
-      label: file,
-      picked:
-        configuration.autoIncludeActiveFile && file === activePath
-    })),
-    {
-      title: 'Duo Agent: choose files GitLab Duo should read',
-      placeHolder:
-        'The active file is preselected. Add any existing file Duo may edit or need for context.',
-      canPickMany: true,
-      ignoreFocusOut: true
+  while (true) {
+    const selected = await vscode.window.showQuickPick(
+      candidates.map(file => ({
+        label: file,
+        description: 'Available to load on demand',
+        picked:
+          configuration.autoIncludeActiveFile && file === activePath
+      })),
+      {
+        title: 'Duo Agent: choose files Duo may inspect',
+        placeHolder:
+          'Selected files stay available; only the most relevant content is sent initially.',
+        canPickMany: true,
+        ignoreFocusOut: true
+      }
+    );
+
+    if (!selected) {
+      throw new Error('Context selection cancelled.');
     }
-  );
 
-  if (!selected) {
-    throw new Error('Context selection cancelled.');
+    const chosen = selected.map(item => item.label);
+
+    if (
+      configuration.autoIncludeActiveFile &&
+      activePath &&
+      activePath !== '.' &&
+      !chosen.some(value => pathKey(value) === pathKey(activePath))
+    ) {
+      chosen.unshift(activePath);
+    }
+
+    const unique = [...new Set(chosen)];
+
+    if (unique.length <= configuration.maxContextPoolFiles) {
+      return unique;
+    }
+
+    await vscode.window.showWarningMessage(
+      `You selected ${unique.length} files, but ` +
+        `duoAgent.maxContextPoolFiles is ` +
+        `${configuration.maxContextPoolFiles}. Select fewer files.`
+    );
   }
-
-  const chosen = selected.map(item => item.label);
-
-  if (
-    configuration.autoIncludeActiveFile &&
-    activePath &&
-    activePath !== '.' &&
-    !chosen.some(value => pathKey(value) === pathKey(activePath))
-  ) {
-    chosen.unshift(activePath);
-  }
-
-  return [...new Set(chosen)].slice(0, configuration.maxContextFiles);
 }
 
 function decodeContext(bytes, file) {
@@ -161,56 +191,104 @@ function decodeContext(bytes, file) {
   }
 }
 
+function fileContextChunk(requestId, file, state, content) {
+  return (
+    `FILE_CONTEXT_BEGIN ${requestId}\n` +
+    `PATH: ${file}\n` +
+    `SHA256: ${state.sha256}\n` +
+    `SOURCE: ${state.wasDirty ? 'UNSAVED_EDITOR_BUFFER' : 'FILE'}\n` +
+    `CONTENT_BEGIN ${requestId}\n${content}\n` +
+    `CONTENT_END ${requestId}\n` +
+    `FILE_CONTEXT_END ${requestId}`
+  );
+}
+
+function joinedContext(chunks) {
+  return (
+    chunks.join('\n\n') ||
+    'No complete file context was loaded.'
+  );
+}
+
 async function readContext(
   repositoryRoot,
   files,
   configuration,
-  requestId
+  requestId,
+  createPrompt
 ) {
   const chunks = [];
   const snapshots = [];
+  const loadedFiles = [];
+  const skipped = [];
   let totalCharacters = 0;
+  let prompt = createPrompt(joinedContext(chunks), loadedFiles);
+
+  if (prompt.length > configuration.maxPromptCharacters) {
+    throw new Error(
+      `The task instructions and repository inventory use ` +
+        `${prompt.length} characters, exceeding ` +
+        `duoAgent.maxPromptCharacters before file context is added.`
+    );
+  }
 
   for (const file of files) {
-    const state = await readFileState(repositoryRoot, file);
+    if (loadedFiles.length >= configuration.maxContextFiles) {
+      skipped.push({ path: file, reason: 'file-count limit' });
+      continue;
+    }
+
+    let state;
+
+    try {
+      state = await readFileState(repositoryRoot, file);
+    } catch (error) {
+      skipped.push({
+        path: file,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      continue;
+    }
 
     if (!state.exists) {
-      throw new Error(`Context file no longer exists: ${file}`);
+      skipped.push({ path: file, reason: 'file no longer exists' });
+      continue;
     }
 
     const content = decodeContext(state.bytes, file);
+    const chunk = fileContextChunk(requestId, file, state, content);
+    const projectedChunks = [...chunks, chunk];
+    const projectedLoaded = [...loadedFiles, file];
+    const projectedPrompt = createPrompt(
+      joinedContext(projectedChunks),
+      projectedLoaded
+    );
+    const reason = contextLimitReason({
+      fileCount: loadedFiles.length,
+      contentCharacters: totalCharacters,
+      nextContentCharacters: content.length,
+      projectedPromptCharacters: projectedPrompt.length,
+      maxFiles: configuration.maxContextFiles,
+      maxContextCharacters: configuration.maxContextCharacters,
+      maxCharactersPerFile: configuration.maxCharactersPerFile,
+      maxPromptCharacters: configuration.maxPromptCharacters
+    });
 
-    if (content.length > configuration.maxCharactersPerFile) {
-      throw new Error(
-        `${file} exceeds duoAgent.maxCharactersPerFile.`
-      );
-    }
-
-    if (
-      totalCharacters + content.length >
-      configuration.maxContextCharacters
-    ) {
-      throw new Error(
-        'Selected context exceeds duoAgent.maxContextCharacters.'
-      );
+    if (reason) {
+      skipped.push({ path: file, reason });
+      continue;
     }
 
     totalCharacters += content.length;
+    loadedFiles.push(file);
+    chunks.push(chunk);
     snapshots.push({
       path: file,
       sha256: state.sha256,
       size: state.bytes.length,
       wasDirty: state.wasDirty
     });
-    chunks.push(
-      `FILE_CONTEXT_BEGIN ${requestId}\n` +
-        `PATH: ${file}\n` +
-        `SHA256: ${state.sha256}\n` +
-        `SOURCE: ${state.wasDirty ? 'UNSAVED_EDITOR_BUFFER' : 'FILE'}\n` +
-        `CONTENT_BEGIN ${requestId}\n${content}\n` +
-        `CONTENT_END ${requestId}\n` +
-        `FILE_CONTEXT_END ${requestId}`
-    );
+    prompt = projectedPrompt;
   }
 
   const editor = vscode.window.activeTextEditor;
@@ -224,42 +302,52 @@ async function readContext(
       repositoryRoot,
       editor.document.uri.fsPath
     );
-    const alreadyFullContext = files.some(
+    const alreadyFullContext = loadedFiles.some(
       file => pathKey(file) === pathKey(relativePath ?? '')
     );
 
     if (relativePath && relativePath !== '.' && !alreadyFullContext) {
       const selection = editor.document.getText(editor.selection);
-
-      if (selection.length > configuration.maxCharactersPerFile) {
-        throw new Error(
-          'Active selection exceeds duoAgent.maxCharactersPerFile.'
-        );
-      }
-
-      if (
-        totalCharacters + selection.length >
-        configuration.maxContextCharacters
-      ) {
-        throw new Error(
-          'Selected files plus the active selection exceed ' +
-            'duoAgent.maxContextCharacters.'
-        );
-      }
-
-      chunks.push(
+      const selectionChunk =
         `ACTIVE_SELECTION_BEGIN ${requestId}\n` +
           `PATH: ${relativePath}\n${selection}\n` +
-          `ACTIVE_SELECTION_END ${requestId}`
+          `ACTIVE_SELECTION_END ${requestId}`;
+      const projectedChunks = [...chunks, selectionChunk];
+      const projectedPrompt = createPrompt(
+        joinedContext(projectedChunks),
+        loadedFiles
       );
+      const reason = contextLimitReason({
+        fileCount: loadedFiles.length,
+        contentCharacters: totalCharacters,
+        nextContentCharacters: selection.length,
+        projectedPromptCharacters: projectedPrompt.length,
+        maxFiles: configuration.maxContextFiles + 1,
+        maxContextCharacters: configuration.maxContextCharacters,
+        maxCharactersPerFile: configuration.maxCharactersPerFile,
+        maxPromptCharacters: configuration.maxPromptCharacters
+      });
+
+      if (reason) {
+        skipped.push({
+          path: `${relativePath} (active selection)`,
+          reason
+        });
+      } else {
+        chunks.push(selectionChunk);
+        totalCharacters += selection.length;
+        prompt = projectedPrompt;
+      }
     }
   }
 
   return {
-    contextText:
-      chunks.join('\n\n') ||
-      'No complete file context was selected.',
-    snapshots
+    contextText: joinedContext(chunks),
+    snapshots,
+    loadedFiles,
+    skipped,
+    totalCharacters,
+    prompt
   };
 }
 
@@ -272,6 +360,283 @@ async function ensureSameBranch(pending) {
         'Run the task again on this branch.'
     );
   }
+}
+
+async function ensureContextSnapshotsCurrent(pending) {
+  for (const snapshot of pending.contextSnapshots ?? []) {
+    const state = await readFileState(
+      pending.repositoryRoot,
+      snapshot.path
+    );
+
+    if (!state.exists || state.sha256 !== snapshot.sha256) {
+      throw new Error(
+        `${snapshot.path} changed while GitLab Duo was gathering ` +
+          'context. Run the task again.'
+      );
+    }
+  }
+}
+
+function includesPath(files, candidate) {
+  const expected = pathKey(candidate);
+  return files.some(file => pathKey(file) === expected);
+}
+
+function uniquePaths(files) {
+  const seen = new Set();
+
+  return files.filter(file => {
+    const key = pathKey(file);
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function roundPromptFactory(options) {
+  const {
+    pending,
+    requestId,
+    round,
+    contextPool,
+    configuration
+  } = options;
+
+  return (contextText, loadedFiles) =>
+    buildMasterPrompt({
+      requestId,
+      taskId: pending.taskId,
+      contextRound: round,
+      maxContextRounds: configuration.maxContextRounds,
+      task: pending.task,
+      allowedPaths: pending.allowedPaths,
+      allowDelete: pending.allowDelete,
+      files: pending.inventory,
+      contextText,
+      contextCatalog: buildContextCatalog(
+        contextPool,
+        loadedFiles
+      ),
+      targetResponseCharacters:
+        configuration.targetResponseCharacters
+    });
+}
+
+async function stopPendingTask(context, message) {
+  await context.workspaceState.update(PENDING_KEY, undefined);
+  log(`Task stopped: ${message}`);
+  vscode.window.showWarningMessage(message);
+}
+
+async function approveContextPoolExpansion(
+  context,
+  pending,
+  requestedPaths,
+  configuration
+) {
+  const outsidePool = requestedPaths.filter(
+    file => !includesPath(pending.contextPool, file)
+  );
+
+  if (outsidePool.length === 0) return pending.contextPool;
+
+  const unknown = outsidePool.filter(
+    file => !includesPath(pending.inventory, file)
+  );
+
+  if (unknown.length > 0) {
+    await stopPendingTask(
+      context,
+      `GitLab Duo requested file(s) outside the supplied repository ` +
+        `inventory: ${unknown.join(', ')}. No files were changed.`
+    );
+    return undefined;
+  }
+
+  const expanded = uniquePaths([
+    ...pending.contextPool,
+    ...outsidePool
+  ]);
+
+  if (expanded.length > configuration.maxContextPoolFiles) {
+    await stopPendingTask(
+      context,
+      `The requested context would exceed ` +
+        `duoAgent.maxContextPoolFiles ` +
+        `(${configuration.maxContextPoolFiles}). No files were changed.`
+    );
+    return undefined;
+  }
+
+  const approval = await vscode.window.showWarningMessage(
+    `GitLab Duo requested access to ${outsidePool.length} additional ` +
+      'file(s).',
+    {
+      modal: true,
+      detail: outsidePool.join('\n')
+    },
+    'Allow Requested Files'
+  );
+
+  if (approval !== 'Allow Requested Files') {
+    await stopPendingTask(
+      context,
+      'Additional file access was not approved. No files were changed.'
+    );
+    return undefined;
+  }
+
+  return expanded;
+}
+
+async function continueWithRequestedContext(
+  context,
+  pending,
+  contextRequest,
+  configuration
+) {
+  if (pending.round >= configuration.maxContextRounds) {
+    await stopPendingTask(
+      context,
+      `GitLab Duo still needs more context after ` +
+        `${configuration.maxContextRounds} rounds. Split the task into ` +
+        'smaller changes. No files were changed.'
+    );
+    return;
+  }
+
+  await ensureContextSnapshotsCurrent(pending);
+
+  const requestedPaths = contextRequest.paths.map(
+    normalizeRepositoryPath
+  );
+  const newRequests = requestedPaths.filter(
+    file => !includesPath(pending.contextFiles, file)
+  );
+
+  if (newRequests.length === 0) {
+    await stopPendingTask(
+      context,
+      'GitLab Duo requested only files that were already loaded. ' +
+        'No files were changed.'
+    );
+    return;
+  }
+
+  const contextPool = await approveContextPoolExpansion(
+    context,
+    pending,
+    newRequests,
+    configuration
+  );
+
+  if (!contextPool) return;
+
+  const taskId = randomUUID();
+  const requestId = randomUUID();
+  const round = pending.round + 1;
+  const filesToLoad = uniquePaths([
+    ...pending.contextFiles,
+    ...newRequests
+  ]);
+  const promptPending = {
+    ...pending,
+    contextPool
+  };
+  const createPrompt = roundPromptFactory({
+    pending: promptPending,
+    requestId,
+    round,
+    contextPool,
+    configuration
+  });
+  const collected = await readContext(
+    pending.repositoryRoot,
+    filesToLoad,
+    configuration,
+    requestId,
+    createPrompt
+  );
+  const missingPrevious = pending.contextFiles.filter(
+    file => !includesPath(collected.loadedFiles, file)
+  );
+
+  if (missingPrevious.length > 0) {
+    await stopPendingTask(
+      context,
+      `Previously loaded context no longer fits the configured budget: ` +
+        `${missingPrevious.join(', ')}. No files were changed.`
+    );
+    return;
+  }
+
+  const added = collected.loadedFiles.filter(
+    file => !includesPath(pending.contextFiles, file)
+  );
+
+  if (added.length === 0) {
+    const details = collected.skipped
+      .filter(item => newRequests.some(
+        file => pathKey(file) === pathKey(item.path)
+      ))
+      .map(item => `${item.path}: ${item.reason}`)
+      .join('; ');
+    await stopPendingTask(
+      context,
+      `The requested files do not fit the configured context budget` +
+        `${details ? ` (${details})` : ''}. Split the task or raise the ` +
+        'relevant context limit. No files were changed.'
+    );
+    return;
+  }
+
+  const nextPending = {
+    ...pending,
+    protocol: PROTOCOL,
+    requestId,
+    round,
+    contextPool,
+    contextFiles: collected.loadedFiles,
+    contextSnapshots: collected.snapshots
+  };
+
+  await context.workspaceState.update(PENDING_KEY, nextPending);
+  await context.workspaceState.update(
+    LAST_PROMPT_KEY,
+    collected.prompt
+  );
+
+  log(
+    `Context round ${round}: loaded ${added.join(', ')}; ` +
+      `reason: ${contextRequest.reason}`
+  );
+  for (const item of collected.skipped) {
+    log(`Context not loaded: ${item.path} (${item.reason})`);
+  }
+
+  vscode.window.showInformationMessage(
+    `GitLab Duo requested ${newRequests.length} file(s); ` +
+      `loaded ${added.length}. Sending context round ${round} of ` +
+      `${configuration.maxContextRounds}.`
+  );
+
+  const possibleResponse = await sendToGitLab(collected.prompt);
+
+  if (
+    typeof possibleResponse === 'string' &&
+    possibleResponse.includes(requestId)
+  ) {
+    await vscode.env.clipboard.writeText(possibleResponse);
+  }
+
+  startResponseWatcher(
+    context,
+    requestId,
+    configuration,
+    50
+  );
 }
 
 async function applyFromClipboard(context) {
@@ -305,8 +670,19 @@ async function applyFromClipboard(context) {
       configuration.maxResponseBytes
     );
 
-    if (response.noChanges) {
+    if (response.kind === 'needsContext') {
+      await continueWithRequestedContext(
+        context,
+        pending,
+        response.contextRequest,
+        configuration
+      );
+      return;
+    }
+
+    if (response.kind === 'noChanges') {
       log(`GitLab Duo returned no changes: ${response.reason}`);
+      await context.workspaceState.update(PENDING_KEY, undefined);
       vscode.window.showWarningMessage(
         `GitLab Duo could not produce changes: ${response.reason}`
       );
@@ -390,6 +766,26 @@ async function waitForCopiedResponse(
     'Duo Agent stopped waiting for the copied response. Copy the response ' +
       'and run “Duo Agent: Apply Copied Response”.'
   );
+}
+
+function startResponseWatcher(
+  context,
+  requestId,
+  configuration,
+  delayMilliseconds = 0
+) {
+  wait(delayMilliseconds)
+    .then(() =>
+      waitForCopiedResponse(context, requestId, configuration)
+    )
+    .catch(error => {
+      const message = error instanceof Error
+        ? error.message
+        : String(error);
+      log(`[ERROR] ${message}`);
+      getOutput().show(true);
+      vscode.window.showErrorMessage(`Duo Agent: ${message}`);
+    });
 }
 
 function taskMayDelete(task) {
@@ -501,40 +897,60 @@ async function runTask(extensionContext) {
       configuration.maxFilePickerEntries
     )
   );
-  const contextFiles = await chooseContextFiles(
+  const contextPool = await chooseContextPool(
     repositoryRoot,
     allFiles,
     configuration
   );
   const requestId = randomUUID();
-  const collected = await readContext(
-    repositoryRoot,
-    contextFiles,
-    configuration,
-    requestId
-  );
+  const openPaths = openRepositoryDocumentPaths(repositoryRoot);
   const inventory = [...new Set([
     ...allFiles,
-    ...openRepositoryDocumentPaths(repositoryRoot)
+    ...openPaths
   ])]
     .sort((left, right) => left.localeCompare(right))
     .slice(0, configuration.maxTreeEntries);
-  const prompt = buildMasterPrompt({
-    requestId,
+  const rankedContext = rankContextFiles({
+    files: contextPool,
+    activePath: activeRelativePath,
+    task: task.trim(),
+    openPaths,
+    allowedPaths
+  });
+  const promptState = {
+    taskId,
     task: task.trim(),
     allowedPaths,
     allowDelete,
-    files: inventory,
-    contextText: collected.contextText
-  });
-  const pending = {
-    protocol: 'duo-agent-json-v1',
+    inventory
+  };
+  const createPrompt = roundPromptFactory({
+    pending: promptState,
     requestId,
+    round: 1,
+    contextPool,
+    configuration
+  });
+  const collected = await readContext(
+    repositoryRoot,
+    rankedContext,
+    configuration,
+    requestId,
+    createPrompt
+  );
+  const prompt = collected.prompt;
+  const pending = {
+    protocol: PROTOCOL,
+    taskId,
+    requestId,
+    round: 1,
     task: task.trim(),
     repositoryRoot,
     branchAtRequest,
     allowedPaths,
-    contextFiles,
+    inventory,
+    contextPool,
+    contextFiles: collected.loadedFiles,
     contextSnapshots: collected.snapshots,
     allowDelete,
     createdAt: new Date().toISOString()
@@ -547,13 +963,29 @@ async function runTask(extensionContext) {
   log(`Created request ${requestId}`);
   log(`Current branch: ${branchAtRequest || '(detached or unborn)'}`);
   log(`Writable scope: ${allowedPaths.join(', ')}`);
-  log(`Context files: ${contextFiles.join(', ') || '(none)'}`);
+  log(
+    `Accessible context: ${contextPool.join(', ') || '(none)'}`
+  );
+  log(
+    `Loaded context: ${collected.loadedFiles.join(', ') || '(none)'}`
+  );
+  for (const item of collected.skipped) {
+    log(`Context not loaded: ${item.path} (${item.reason})`);
+  }
   log(
     dirtyStatus
       ? 'Existing working changes detected and left in place.'
       : 'No existing Git working changes detected.'
   );
   log('Unsaved editor buffers are read directly; no save is required.');
+
+  vscode.window.showInformationMessage(
+    `${contextPool.length} file(s) accessible · ` +
+      `${collected.loadedFiles.length} loaded · ` +
+      `${prompt.length.toLocaleString()}/` +
+      `${configuration.maxPromptCharacters.toLocaleString()} ` +
+      'prompt characters.'
+  );
 
   const possibleResponse = await sendToGitLab(prompt);
 
@@ -571,18 +1003,11 @@ async function runTask(extensionContext) {
       'the response. Duo Agent will open a review automatically.'
   );
 
-  waitForCopiedResponse(
+  startResponseWatcher(
     extensionContext,
     requestId,
     configuration
-  ).catch(error => {
-    const message = error instanceof Error
-      ? error.message
-      : String(error);
-    log(`[ERROR] ${message}`);
-    getOutput().show(true);
-    vscode.window.showErrorMessage(`Duo Agent: ${message}`);
-  });
+  );
 }
 
 async function undoLastApply(context) {
@@ -616,5 +1041,12 @@ module.exports = {
   applyFromClipboard,
   copyLastPrompt,
   undoLastApply,
-  verifyStaticSend
+  verifyStaticSend,
+  __test: {
+    readContext,
+    ensureContextSnapshotsCurrent,
+    includesPath,
+    uniquePaths,
+    approveContextPoolExpansion
+  }
 };

@@ -78,6 +78,7 @@ Module._load = function patchedLoad(request, parent, isMain) {
 
 const {
   sha256Buffer,
+  applyExactEdits,
   readFileState,
   validatePlan,
   applyPlan
@@ -121,6 +122,82 @@ function workspaceState() {
       else state.set(key, value);
     }
   };
+}
+
+function testExactEditValidation() {
+  assert.equal(
+    applyExactEdits(
+      'alpha\nbeta\ngamma\n',
+      [
+        {
+          oldText: 'alpha',
+          newText: 'first'
+        },
+        {
+          oldText: 'gamma\n',
+          newText: ''
+        }
+      ],
+      'sample.txt'
+    ),
+    'first\nbeta\n'
+  );
+  assert.equal(
+    applyExactEdits(
+      'alpha\nbeta\n',
+      [
+        {
+          oldText: 'beta',
+          newText: 'beta\ninserted'
+        }
+      ],
+      'sample.txt'
+    ),
+    'alpha\nbeta\ninserted\n'
+  );
+  assert.throws(
+    () => applyExactEdits(
+      'repeat repeat',
+      [{ oldText: 'repeat', newText: 'changed' }],
+      'sample.txt'
+    ),
+    /ambiguous/
+  );
+  assert.throws(
+    () => applyExactEdits(
+      'content',
+      [{ oldText: 'missing', newText: 'changed' }],
+      'sample.txt'
+    ),
+    /not found/
+  );
+  assert.throws(
+    () => applyExactEdits(
+      'abcdef',
+      [
+        { oldText: 'abc', newText: 'one' },
+        { oldText: 'bc', newText: 'two' }
+      ],
+      'sample.txt'
+    ),
+    /overlap/
+  );
+  assert.throws(
+    () => applyExactEdits(
+      'content',
+      [{ oldText: 'content', newText: 'content' }],
+      'sample.txt'
+    ),
+    /makes no change/
+  );
+  assert.throws(
+    () => applyExactEdits(
+      'content',
+      [{ oldText: 'content', newText: 'bad\0value' }],
+      'sample.txt'
+    ),
+    /NUL/
+  );
 }
 
 async function createRepository(prefix) {
@@ -247,10 +324,15 @@ async function testUnsavedEditorBuffer() {
     summary: 'Update trial.py.',
     operations: [
       {
-        op: 'replace',
+        op: 'edit',
         path: 'trial.py',
         expectedSha256: before.sha256,
-        content: 'print("agent update")\n'
+        edits: [
+          {
+            oldText: 'print("unsaved user work")',
+            newText: 'print("agent update")'
+          }
+        ]
       }
     ]
   };
@@ -282,9 +364,76 @@ async function testUnsavedEditorBuffer() {
   await fsp.rm(root, { recursive: true, force: true });
 }
 
+async function testCompactEditPreservesBomAndEol() {
+  textDocuments.splice(0, textDocuments.length);
+  const root = await createRepository('duo-agent-compact-eol-');
+  const filePath = path.join(root, 'windows.txt');
+  const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+  const original = Buffer.concat([
+    bom,
+    Buffer.from('first\r\nsecond\r\n', 'utf8')
+  ]);
+  await fsp.writeFile(filePath, original);
+  git(root, 'add', '.');
+  git(root, 'commit', '-m', 'initial');
+
+  const requestId = '44444444-5555-6666-7777-888888888888';
+  const pending = {
+    requestId,
+    repositoryRoot: root,
+    branchAtRequest: await currentBranch(root),
+    allowedPaths: ['windows.txt'],
+    contextSnapshots: [
+      {
+        path: 'windows.txt',
+        sha256: sha256Buffer(original),
+        size: original.length,
+        wasDirty: false
+      }
+    ],
+    allowDelete: false
+  };
+  const plan = {
+    requestId,
+    summary: 'Edit the second line.',
+    operations: [
+      {
+        op: 'edit',
+        path: 'windows.txt',
+        expectedSha256: sha256Buffer(original),
+        edits: [
+          {
+            oldText: 'second',
+            newText: 'updated\nthird'
+          }
+        ]
+      }
+    ]
+  };
+  const prepared = await validatePlan(root, plan, pending, {
+    maxOperations: 50,
+    maxFileWriteBytes: 500000,
+    maxTotalWriteBytes: 2000000,
+    preserveExistingEol: true
+  });
+
+  assert.equal(prepared.operations[0].op, 'edit');
+  assert.deepEqual(
+    prepared.operations[0].afterBytes,
+    Buffer.concat([
+      bom,
+      Buffer.from('first\r\nupdated\r\nthird\r\n', 'utf8')
+    ])
+  );
+
+  await fsp.rm(root, { recursive: true, force: true });
+}
+
 (async () => {
+  testExactEditValidation();
   await testDirtyWorkingTreeOnCurrentBranch();
   await testUnsavedEditorBuffer();
+  await testCompactEditPreservesBomAndEol();
   console.log('Duo Agent file-writing tests passed.');
 })().catch(error => {
   console.error(error);

@@ -3,6 +3,7 @@
 const assert = require('assert');
 const {
   PROTOCOL,
+  buildMasterPrompt,
   extractResponse,
   clipboardContainsResponse
 } = require('../src/prompt');
@@ -14,6 +15,25 @@ const {
 
 const requestId = '11111111-2222-3333-4444-555555555555';
 const hash = 'a'.repeat(64);
+const prompt = buildMasterPrompt({
+  requestId,
+  taskId: 'task-1',
+  contextRound: 2,
+  maxContextRounds: 3,
+  task: 'Update the authentication flow.',
+  allowedPaths: ['src'],
+  allowDelete: false,
+  files: ['src/auth.js'],
+  contextText: 'No complete file context was loaded.',
+  contextCatalog: '- src/auth.js [AVAILABLE, NOT LOADED]',
+  targetResponseCharacters: 24000
+});
+assert.match(prompt, /TASK ID\ntask-1/);
+assert.match(prompt, /CONTEXT ROUND\n2 of 3/);
+assert.match(prompt, /"needsContext"/);
+assert.match(prompt, /"op": "edit"/);
+assert.match(prompt, /below 24000 characters/);
+
 const response = JSON.stringify({
   protocol: PROTOCOL,
   requestId,
@@ -39,6 +59,7 @@ const response = JSON.stringify({
 });
 
 const parsed = extractResponse(response, requestId);
+assert.equal(parsed.kind, 'changes');
 assert.equal(parsed.noChanges, false);
 assert.equal(parsed.plan.operations.length, 3);
 assert.equal(parsed.plan.operations[1].expectedSha256, hash);
@@ -57,7 +78,142 @@ const noChanges = JSON.stringify({
   noChanges: true,
   reason: 'A required interface was not supplied.'
 });
-assert.equal(extractResponse(noChanges, requestId).noChanges, true);
+assert.equal(extractResponse(noChanges, requestId).kind, 'noChanges');
+
+const needsContext = JSON.stringify({
+  protocol: PROTOCOL,
+  requestId,
+  needsContext: {
+    paths: ['src/auth.js', './src/routes.js'],
+    reason: 'The route contract is required.'
+  }
+});
+const contextRequest = extractResponse(needsContext, requestId);
+assert.equal(contextRequest.kind, 'needsContext');
+assert.deepEqual(
+  contextRequest.contextRequest.paths,
+  ['src/auth.js', 'src/routes.js']
+);
+assert.equal(
+  clipboardContainsResponse(needsContext, requestId),
+  true
+);
+
+const compactEdit = extractResponse(
+  JSON.stringify({
+    protocol: PROTOCOL,
+    requestId,
+    summary: 'Edit a focused section.',
+    operations: [
+      {
+        op: 'edit',
+        path: 'src/auth.js',
+        expectedSha256: hash,
+        edits: [
+          {
+            oldText: 'const enabled = false;',
+            newText: 'const enabled = true;'
+          }
+        ]
+      }
+    ]
+  }),
+  requestId
+);
+assert.equal(compactEdit.plan.operations[0].op, 'edit');
+assert.equal(
+  compactEdit.plan.operations[0].edits[0].newText,
+  'const enabled = true;'
+);
+
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      summary: 'Invalid compact edit.',
+      operations: [
+        {
+          op: 'edit',
+          path: 'src/auth.js',
+          expectedSha256: hash,
+          edits: [{ oldText: '', newText: 'value' }]
+        }
+      ]
+    }),
+    requestId
+  ),
+  /oldText must be non-empty/
+);
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      summary: 'No-op compact edit.',
+      operations: [
+        {
+          op: 'edit',
+          path: 'src/auth.js',
+          expectedSha256: hash,
+          edits: [{ oldText: 'same', newText: 'same' }]
+        }
+      ]
+    }),
+    requestId
+  ),
+  /must change the text/
+);
+
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      needsContext: {
+        paths: ['../secret'],
+        reason: 'Need it.'
+      }
+    }),
+    requestId
+  ),
+  /Unsafe path/
+);
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      needsContext: {
+        paths: ['src/a.js', './src/a.js'],
+        reason: 'Need it.'
+      }
+    }),
+    requestId
+  ),
+  /duplicate path/
+);
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      needsContext: {
+        paths: [
+          '1.js',
+          '2.js',
+          '3.js',
+          '4.js',
+          '5.js',
+          '6.js'
+        ],
+        reason: 'Too many.'
+      }
+    }),
+    requestId
+  ),
+  /1 to 5 paths/
+);
 
 assert.throws(
   () => extractResponse('{"protocol":"wrong"}', requestId),
