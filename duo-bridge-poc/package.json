@@ -36,7 +36,7 @@
     "GitLab.gitlab-workflow"
   ],
   "scripts": {
-    "test": "node test/protocol.test.js && node test/context.test.js && node test/operations.test.js"
+    "test": "node test/protocol.test.js && node test/context.test.js && node test/workflow.test.js && node test/operations.test.js"
   },
   "contributes": {
     "commands": [

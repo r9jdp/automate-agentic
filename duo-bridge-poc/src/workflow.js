@@ -22,10 +22,12 @@ const {
 } = require('./git');
 const {
   repositoryPath,
+  normalizeRepositoryPath,
   parseAllowedPaths,
   pathKey
 } = require('./paths');
 const {
+  PROTOCOL,
   buildMasterPrompt,
   extractResponse,
   clipboardContainsResponse
@@ -360,6 +362,283 @@ async function ensureSameBranch(pending) {
   }
 }
 
+async function ensureContextSnapshotsCurrent(pending) {
+  for (const snapshot of pending.contextSnapshots ?? []) {
+    const state = await readFileState(
+      pending.repositoryRoot,
+      snapshot.path
+    );
+
+    if (!state.exists || state.sha256 !== snapshot.sha256) {
+      throw new Error(
+        `${snapshot.path} changed while GitLab Duo was gathering ` +
+          'context. Run the task again.'
+      );
+    }
+  }
+}
+
+function includesPath(files, candidate) {
+  const expected = pathKey(candidate);
+  return files.some(file => pathKey(file) === expected);
+}
+
+function uniquePaths(files) {
+  const seen = new Set();
+
+  return files.filter(file => {
+    const key = pathKey(file);
+
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function roundPromptFactory(options) {
+  const {
+    pending,
+    requestId,
+    round,
+    contextPool,
+    configuration
+  } = options;
+
+  return (contextText, loadedFiles) =>
+    buildMasterPrompt({
+      requestId,
+      taskId: pending.taskId,
+      contextRound: round,
+      maxContextRounds: configuration.maxContextRounds,
+      task: pending.task,
+      allowedPaths: pending.allowedPaths,
+      allowDelete: pending.allowDelete,
+      files: pending.inventory,
+      contextText,
+      contextCatalog: buildContextCatalog(
+        contextPool,
+        loadedFiles
+      ),
+      targetResponseCharacters:
+        configuration.targetResponseCharacters
+    });
+}
+
+async function stopPendingTask(context, message) {
+  await context.workspaceState.update(PENDING_KEY, undefined);
+  log(`Task stopped: ${message}`);
+  vscode.window.showWarningMessage(message);
+}
+
+async function approveContextPoolExpansion(
+  context,
+  pending,
+  requestedPaths,
+  configuration
+) {
+  const outsidePool = requestedPaths.filter(
+    file => !includesPath(pending.contextPool, file)
+  );
+
+  if (outsidePool.length === 0) return pending.contextPool;
+
+  const unknown = outsidePool.filter(
+    file => !includesPath(pending.inventory, file)
+  );
+
+  if (unknown.length > 0) {
+    await stopPendingTask(
+      context,
+      `GitLab Duo requested file(s) outside the supplied repository ` +
+        `inventory: ${unknown.join(', ')}. No files were changed.`
+    );
+    return undefined;
+  }
+
+  const expanded = uniquePaths([
+    ...pending.contextPool,
+    ...outsidePool
+  ]);
+
+  if (expanded.length > configuration.maxContextPoolFiles) {
+    await stopPendingTask(
+      context,
+      `The requested context would exceed ` +
+        `duoAgent.maxContextPoolFiles ` +
+        `(${configuration.maxContextPoolFiles}). No files were changed.`
+    );
+    return undefined;
+  }
+
+  const approval = await vscode.window.showWarningMessage(
+    `GitLab Duo requested access to ${outsidePool.length} additional ` +
+      'file(s).',
+    {
+      modal: true,
+      detail: outsidePool.join('\n')
+    },
+    'Allow Requested Files'
+  );
+
+  if (approval !== 'Allow Requested Files') {
+    await stopPendingTask(
+      context,
+      'Additional file access was not approved. No files were changed.'
+    );
+    return undefined;
+  }
+
+  return expanded;
+}
+
+async function continueWithRequestedContext(
+  context,
+  pending,
+  contextRequest,
+  configuration
+) {
+  if (pending.round >= configuration.maxContextRounds) {
+    await stopPendingTask(
+      context,
+      `GitLab Duo still needs more context after ` +
+        `${configuration.maxContextRounds} rounds. Split the task into ` +
+        'smaller changes. No files were changed.'
+    );
+    return;
+  }
+
+  await ensureContextSnapshotsCurrent(pending);
+
+  const requestedPaths = contextRequest.paths.map(
+    normalizeRepositoryPath
+  );
+  const newRequests = requestedPaths.filter(
+    file => !includesPath(pending.contextFiles, file)
+  );
+
+  if (newRequests.length === 0) {
+    await stopPendingTask(
+      context,
+      'GitLab Duo requested only files that were already loaded. ' +
+        'No files were changed.'
+    );
+    return;
+  }
+
+  const contextPool = await approveContextPoolExpansion(
+    context,
+    pending,
+    newRequests,
+    configuration
+  );
+
+  if (!contextPool) return;
+
+  const taskId = randomUUID();
+  const requestId = randomUUID();
+  const round = pending.round + 1;
+  const filesToLoad = uniquePaths([
+    ...pending.contextFiles,
+    ...newRequests
+  ]);
+  const promptPending = {
+    ...pending,
+    contextPool
+  };
+  const createPrompt = roundPromptFactory({
+    pending: promptPending,
+    requestId,
+    round,
+    contextPool,
+    configuration
+  });
+  const collected = await readContext(
+    pending.repositoryRoot,
+    filesToLoad,
+    configuration,
+    requestId,
+    createPrompt
+  );
+  const missingPrevious = pending.contextFiles.filter(
+    file => !includesPath(collected.loadedFiles, file)
+  );
+
+  if (missingPrevious.length > 0) {
+    await stopPendingTask(
+      context,
+      `Previously loaded context no longer fits the configured budget: ` +
+        `${missingPrevious.join(', ')}. No files were changed.`
+    );
+    return;
+  }
+
+  const added = collected.loadedFiles.filter(
+    file => !includesPath(pending.contextFiles, file)
+  );
+
+  if (added.length === 0) {
+    const details = collected.skipped
+      .filter(item => newRequests.some(
+        file => pathKey(file) === pathKey(item.path)
+      ))
+      .map(item => `${item.path}: ${item.reason}`)
+      .join('; ');
+    await stopPendingTask(
+      context,
+      `The requested files do not fit the configured context budget` +
+        `${details ? ` (${details})` : ''}. Split the task or raise the ` +
+        'relevant context limit. No files were changed.'
+    );
+    return;
+  }
+
+  const nextPending = {
+    ...pending,
+    protocol: PROTOCOL,
+    requestId,
+    round,
+    contextPool,
+    contextFiles: collected.loadedFiles,
+    contextSnapshots: collected.snapshots
+  };
+
+  await context.workspaceState.update(PENDING_KEY, nextPending);
+  await context.workspaceState.update(
+    LAST_PROMPT_KEY,
+    collected.prompt
+  );
+
+  log(
+    `Context round ${round}: loaded ${added.join(', ')}; ` +
+      `reason: ${contextRequest.reason}`
+  );
+  for (const item of collected.skipped) {
+    log(`Context not loaded: ${item.path} (${item.reason})`);
+  }
+
+  vscode.window.showInformationMessage(
+    `GitLab Duo requested ${newRequests.length} file(s); ` +
+      `loaded ${added.length}. Sending context round ${round} of ` +
+      `${configuration.maxContextRounds}.`
+  );
+
+  const possibleResponse = await sendToGitLab(collected.prompt);
+
+  if (
+    typeof possibleResponse === 'string' &&
+    possibleResponse.includes(requestId)
+  ) {
+    await vscode.env.clipboard.writeText(possibleResponse);
+  }
+
+  startResponseWatcher(
+    context,
+    requestId,
+    configuration,
+    50
+  );
+}
+
 async function applyFromClipboard(context) {
   if (!vscode.workspace.isTrusted) {
     throw new Error('Trust the workspace before applying changes.');
@@ -391,8 +670,19 @@ async function applyFromClipboard(context) {
       configuration.maxResponseBytes
     );
 
-    if (response.noChanges) {
+    if (response.kind === 'needsContext') {
+      await continueWithRequestedContext(
+        context,
+        pending,
+        response.contextRequest,
+        configuration
+      );
+      return;
+    }
+
+    if (response.kind === 'noChanges') {
       log(`GitLab Duo returned no changes: ${response.reason}`);
+      await context.workspaceState.update(PENDING_KEY, undefined);
       vscode.window.showWarningMessage(
         `GitLab Duo could not produce changes: ${response.reason}`
       );
@@ -476,6 +766,26 @@ async function waitForCopiedResponse(
     'Duo Agent stopped waiting for the copied response. Copy the response ' +
       'and run “Duo Agent: Apply Copied Response”.'
   );
+}
+
+function startResponseWatcher(
+  context,
+  requestId,
+  configuration,
+  delayMilliseconds = 0
+) {
+  wait(delayMilliseconds)
+    .then(() =>
+      waitForCopiedResponse(context, requestId, configuration)
+    )
+    .catch(error => {
+      const message = error instanceof Error
+        ? error.message
+        : String(error);
+      log(`[ERROR] ${message}`);
+      getOutput().show(true);
+      vscode.window.showErrorMessage(`Duo Agent: ${message}`);
+    });
 }
 
 function taskMayDelete(task) {
@@ -607,21 +917,20 @@ async function runTask(extensionContext) {
     openPaths,
     allowedPaths
   });
-  const createPrompt = (contextText, loadedFiles) =>
-    buildMasterPrompt({
-      requestId,
-      task: task.trim(),
-      allowedPaths,
-      allowDelete,
-      files: inventory,
-      contextText,
-      contextCatalog: buildContextCatalog(
-        contextPool,
-        loadedFiles
-      ),
-      targetResponseCharacters:
-        configuration.targetResponseCharacters
-    });
+  const promptState = {
+    taskId,
+    task: task.trim(),
+    allowedPaths,
+    allowDelete,
+    inventory
+  };
+  const createPrompt = roundPromptFactory({
+    pending: promptState,
+    requestId,
+    round: 1,
+    contextPool,
+    configuration
+  });
   const collected = await readContext(
     repositoryRoot,
     rankedContext,
@@ -631,12 +940,15 @@ async function runTask(extensionContext) {
   );
   const prompt = collected.prompt;
   const pending = {
-    protocol: 'duo-agent-json-v1',
+    protocol: PROTOCOL,
+    taskId,
     requestId,
+    round: 1,
     task: task.trim(),
     repositoryRoot,
     branchAtRequest,
     allowedPaths,
+    inventory,
     contextPool,
     contextFiles: collected.loadedFiles,
     contextSnapshots: collected.snapshots,
@@ -691,18 +1003,11 @@ async function runTask(extensionContext) {
       'the response. Duo Agent will open a review automatically.'
   );
 
-  waitForCopiedResponse(
+  startResponseWatcher(
     extensionContext,
     requestId,
     configuration
-  ).catch(error => {
-    const message = error instanceof Error
-      ? error.message
-      : String(error);
-    log(`[ERROR] ${message}`);
-    getOutput().show(true);
-    vscode.window.showErrorMessage(`Duo Agent: ${message}`);
-  });
+  );
 }
 
 async function undoLastApply(context) {
@@ -736,5 +1041,12 @@ module.exports = {
   applyFromClipboard,
   copyLastPrompt,
   undoLastApply,
-  verifyStaticSend
+  verifyStaticSend,
+  __test: {
+    readContext,
+    ensureContextSnapshotsCurrent,
+    includesPath,
+    uniquePaths,
+    approveContextPoolExpansion
+  }
 };
