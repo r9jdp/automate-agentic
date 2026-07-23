@@ -173,7 +173,7 @@
           "default": 50,
           "minimum": 1,
           "maximum": 200,
-          "description": "Maximum number of create, replace, or delete changes accepted in one response."
+          "description": "Maximum number of create, replace, edit, or delete changes accepted in one response."
         },
         "duoAgent.preserveExistingEol": {
           "type": "boolean",

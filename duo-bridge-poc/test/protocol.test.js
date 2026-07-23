@@ -31,6 +31,7 @@ const prompt = buildMasterPrompt({
 assert.match(prompt, /TASK ID\ntask-1/);
 assert.match(prompt, /CONTEXT ROUND\n2 of 3/);
 assert.match(prompt, /"needsContext"/);
+assert.match(prompt, /"op": "edit"/);
 assert.match(prompt, /below 24000 characters/);
 
 const response = JSON.stringify({
@@ -96,6 +97,72 @@ assert.deepEqual(
 assert.equal(
   clipboardContainsResponse(needsContext, requestId),
   true
+);
+
+const compactEdit = extractResponse(
+  JSON.stringify({
+    protocol: PROTOCOL,
+    requestId,
+    summary: 'Edit a focused section.',
+    operations: [
+      {
+        op: 'edit',
+        path: 'src/auth.js',
+        expectedSha256: hash,
+        edits: [
+          {
+            oldText: 'const enabled = false;',
+            newText: 'const enabled = true;'
+          }
+        ]
+      }
+    ]
+  }),
+  requestId
+);
+assert.equal(compactEdit.plan.operations[0].op, 'edit');
+assert.equal(
+  compactEdit.plan.operations[0].edits[0].newText,
+  'const enabled = true;'
+);
+
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      summary: 'Invalid compact edit.',
+      operations: [
+        {
+          op: 'edit',
+          path: 'src/auth.js',
+          expectedSha256: hash,
+          edits: [{ oldText: '', newText: 'value' }]
+        }
+      ]
+    }),
+    requestId
+  ),
+  /oldText must be non-empty/
+);
+assert.throws(
+  () => extractResponse(
+    JSON.stringify({
+      protocol: PROTOCOL,
+      requestId,
+      summary: 'No-op compact edit.',
+      operations: [
+        {
+          op: 'edit',
+          path: 'src/auth.js',
+          expectedSha256: hash,
+          edits: [{ oldText: 'same', newText: 'same' }]
+        }
+      ]
+    }),
+    requestId
+  ),
+  /must change the text/
 );
 
 assert.throws(

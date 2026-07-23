@@ -240,6 +240,117 @@ function detectPathConflicts(operations) {
   }
 }
 
+function textOccurrences(content, search) {
+  const matches = [];
+  let offset = 0;
+
+  while (offset <= content.length - search.length) {
+    const index = content.indexOf(search, offset);
+
+    if (index < 0) break;
+    matches.push(index);
+    offset = index + 1;
+  }
+
+  return matches;
+}
+
+function applyExactEdits(content, edits, relativePath = 'file') {
+  if (!Array.isArray(edits) || edits.length === 0) {
+    throw new Error(
+      `Compact edit for ${relativePath} must contain at least one edit.`
+    );
+  }
+
+  if (edits.length > 100) {
+    throw new Error(
+      `Compact edit for ${relativePath} exceeds 100 text edits.`
+    );
+  }
+
+  const located = edits.map((edit, index) => {
+    const label = `Compact edit ${index + 1} for ${relativePath}`;
+
+    if (
+      !edit ||
+      typeof edit !== 'object' ||
+      Array.isArray(edit)
+    ) {
+      throw new Error(`${label} must be an object.`);
+    }
+
+    if (typeof edit.oldText !== 'string' || !edit.oldText) {
+      throw new Error(`${label} oldText must be non-empty.`);
+    }
+
+    if (typeof edit.newText !== 'string') {
+      throw new Error(`${label} newText must be a string.`);
+    }
+
+    if (
+      edit.oldText.includes('\0') ||
+      edit.newText.includes('\0')
+    ) {
+      throw new Error(`${label} contains a NUL character.`);
+    }
+
+    if (edit.oldText === edit.newText) {
+      throw new Error(`${label} makes no change.`);
+    }
+
+    const matches = textOccurrences(content, edit.oldText);
+
+    if (matches.length === 0) {
+      throw new Error(
+        `${label} oldText was not found in the original file.`
+      );
+    }
+
+    if (matches.length > 1) {
+      throw new Error(
+        `${label} oldText is ambiguous because it occurs ` +
+          `${matches.length} times.`
+      );
+    }
+
+    return {
+      start: matches[0],
+      end: matches[0] + edit.oldText.length,
+      newText: edit.newText,
+      index
+    };
+  });
+  const sorted = [...located].sort(
+    (left, right) => left.start - right.start
+  );
+
+  for (let index = 0; index < sorted.length - 1; index += 1) {
+    if (sorted[index + 1].start < sorted[index].end) {
+      throw new Error(
+        `Compact edits ${sorted[index].index + 1} and ` +
+          `${sorted[index + 1].index + 1} overlap in ${relativePath}.`
+      );
+    }
+  }
+
+  let result = content;
+
+  for (const edit of [...sorted].reverse()) {
+    result =
+      result.slice(0, edit.start) +
+      edit.newText +
+      result.slice(edit.end);
+  }
+
+  if (result === content) {
+    throw new Error(
+      `The compact edit makes no change to ${relativePath}.`
+    );
+  }
+
+  return result;
+}
+
 async function validatePlan(
   repositoryRoot,
   plan,
@@ -364,14 +475,26 @@ async function validatePlan(
       continue;
     }
 
-    if (raw.content.includes('\0')) {
-      throw new Error(
-        `Replacement content contains a NUL character: ${relativePath}`
+    let afterContent;
+
+    if (raw.op === 'edit') {
+      afterContent = applyExactEdits(
+        decodeUtf8(before.bytes, relativePath),
+        raw.edits,
+        relativePath
       );
+    } else {
+      if (raw.content.includes('\0')) {
+        throw new Error(
+          `Replacement content contains a NUL character: ${relativePath}`
+        );
+      }
+
+      afterContent = raw.content;
     }
 
     const afterBytes = encodeContent(
-      raw.content,
+      afterContent,
       before.bytes,
       configuration.preserveExistingEol
     );
@@ -392,7 +515,7 @@ async function validatePlan(
 
     totalWriteBytes += afterBytes.length;
     prepared.push({
-      op: 'replace',
+      op: raw.op,
       path: relativePath,
       before,
       afterBytes,
@@ -617,7 +740,10 @@ async function applyOne(operation) {
     } finally {
       await handle.close();
     }
-  } else if (operation.op === 'replace') {
+  } else if (
+    operation.op === 'replace' ||
+    operation.op === 'edit'
+  ) {
     operation.writeStarted = true;
     await writeBytes(
       operation,
@@ -938,6 +1064,7 @@ async function undoLastApply(context) {
 
 module.exports = {
   sha256Buffer,
+  applyExactEdits,
   readFileState,
   validatePlan,
   previewPlan,
