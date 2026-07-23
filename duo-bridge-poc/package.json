@@ -36,7 +36,7 @@
     "GitLab.gitlab-workflow"
   ],
   "scripts": {
-    "test": "node test/protocol.test.js && node test/operations.test.js"
+    "test": "node test/protocol.test.js && node test/context.test.js && node test/operations.test.js"
   },
   "contributes": {
     "commands": [
@@ -91,12 +91,40 @@
           "maximum": 50,
           "description": "Maximum number of complete files included in a generated prompt."
         },
+        "duoAgent.maxContextPoolFiles": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Maximum number of files made available for on-demand context in one task."
+        },
         "duoAgent.maxContextCharacters": {
           "type": "integer",
-          "default": 90000,
+          "default": 45000,
           "minimum": 1000,
           "maximum": 400000,
-          "description": "Maximum combined number of characters read from selected context files."
+          "description": "Maximum combined characters from complete file context included in a prompt."
+        },
+        "duoAgent.maxPromptCharacters": {
+          "type": "integer",
+          "default": 60000,
+          "minimum": 5000,
+          "maximum": 500000,
+          "description": "Maximum characters in the complete generated prompt, including instructions, inventory, and file context."
+        },
+        "duoAgent.maxContextRounds": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum number of prompt rounds allowed while GitLab Duo requests additional file context."
+        },
+        "duoAgent.targetResponseCharacters": {
+          "type": "integer",
+          "default": 24000,
+          "minimum": 1000,
+          "maximum": 200000,
+          "description": "Target maximum response length communicated to GitLab Duo."
         },
         "duoAgent.maxCharactersPerFile": {
           "type": "integer",

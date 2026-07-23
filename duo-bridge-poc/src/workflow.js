@@ -37,6 +37,11 @@ const {
   applyPlan,
   undoLastApply: undoLastFileChanges
 } = require('./operations');
+const {
+  rankContextFiles,
+  buildContextCatalog,
+  contextLimitReason
+} = require('./context');
 
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 let applyingResponse = false;
@@ -83,7 +88,7 @@ function openRepositoryDocumentPaths(repositoryRoot) {
     .filter(value => value && value !== '.');
 }
 
-async function chooseContextFiles(
+async function chooseContextPool(
   repositoryRoot,
   files,
   configuration
@@ -94,15 +99,25 @@ async function chooseContextFiles(
         vscode.window.activeTextEditor.document.uri.fsPath
       )
     : undefined;
-  const candidates = [...new Set([
+  const allCandidates = [...new Set([
     ...files,
     ...openRepositoryDocumentPaths(repositoryRoot),
     ...(activePath && activePath !== '.' ? [activePath] : [])
   ])]
-    .sort((left, right) => left.localeCompare(right))
-    .slice(0, configuration.maxFilePickerEntries);
+    .sort((left, right) => left.localeCompare(right));
+  const candidates = allCandidates.slice(
+    0,
+    configuration.maxFilePickerEntries
+  );
 
   if (candidates.length === 0) return [];
+
+  if (allCandidates.length > candidates.length) {
+    vscode.window.showInformationMessage(
+      `Duo Agent is showing the first ${candidates.length} files because ` +
+        'of duoAgent.maxFilePickerEntries.'
+    );
+  }
 
   if (
     candidates.length === 1 &&
@@ -112,37 +127,50 @@ async function chooseContextFiles(
     return [activePath];
   }
 
-  const selected = await vscode.window.showQuickPick(
-    candidates.map(file => ({
-      label: file,
-      picked:
-        configuration.autoIncludeActiveFile && file === activePath
-    })),
-    {
-      title: 'Duo Agent: choose files GitLab Duo should read',
-      placeHolder:
-        'The active file is preselected. Add any existing file Duo may edit or need for context.',
-      canPickMany: true,
-      ignoreFocusOut: true
+  while (true) {
+    const selected = await vscode.window.showQuickPick(
+      candidates.map(file => ({
+        label: file,
+        description: 'Available to load on demand',
+        picked:
+          configuration.autoIncludeActiveFile && file === activePath
+      })),
+      {
+        title: 'Duo Agent: choose files Duo may inspect',
+        placeHolder:
+          'Selected files stay available; only the most relevant content is sent initially.',
+        canPickMany: true,
+        ignoreFocusOut: true
+      }
+    );
+
+    if (!selected) {
+      throw new Error('Context selection cancelled.');
     }
-  );
 
-  if (!selected) {
-    throw new Error('Context selection cancelled.');
+    const chosen = selected.map(item => item.label);
+
+    if (
+      configuration.autoIncludeActiveFile &&
+      activePath &&
+      activePath !== '.' &&
+      !chosen.some(value => pathKey(value) === pathKey(activePath))
+    ) {
+      chosen.unshift(activePath);
+    }
+
+    const unique = [...new Set(chosen)];
+
+    if (unique.length <= configuration.maxContextPoolFiles) {
+      return unique;
+    }
+
+    await vscode.window.showWarningMessage(
+      `You selected ${unique.length} files, but ` +
+        `duoAgent.maxContextPoolFiles is ` +
+        `${configuration.maxContextPoolFiles}. Select fewer files.`
+    );
   }
-
-  const chosen = selected.map(item => item.label);
-
-  if (
-    configuration.autoIncludeActiveFile &&
-    activePath &&
-    activePath !== '.' &&
-    !chosen.some(value => pathKey(value) === pathKey(activePath))
-  ) {
-    chosen.unshift(activePath);
-  }
-
-  return [...new Set(chosen)].slice(0, configuration.maxContextFiles);
 }
 
 function decodeContext(bytes, file) {
@@ -161,56 +189,104 @@ function decodeContext(bytes, file) {
   }
 }
 
+function fileContextChunk(requestId, file, state, content) {
+  return (
+    `FILE_CONTEXT_BEGIN ${requestId}\n` +
+    `PATH: ${file}\n` +
+    `SHA256: ${state.sha256}\n` +
+    `SOURCE: ${state.wasDirty ? 'UNSAVED_EDITOR_BUFFER' : 'FILE'}\n` +
+    `CONTENT_BEGIN ${requestId}\n${content}\n` +
+    `CONTENT_END ${requestId}\n` +
+    `FILE_CONTEXT_END ${requestId}`
+  );
+}
+
+function joinedContext(chunks) {
+  return (
+    chunks.join('\n\n') ||
+    'No complete file context was loaded.'
+  );
+}
+
 async function readContext(
   repositoryRoot,
   files,
   configuration,
-  requestId
+  requestId,
+  createPrompt
 ) {
   const chunks = [];
   const snapshots = [];
+  const loadedFiles = [];
+  const skipped = [];
   let totalCharacters = 0;
+  let prompt = createPrompt(joinedContext(chunks), loadedFiles);
+
+  if (prompt.length > configuration.maxPromptCharacters) {
+    throw new Error(
+      `The task instructions and repository inventory use ` +
+        `${prompt.length} characters, exceeding ` +
+        `duoAgent.maxPromptCharacters before file context is added.`
+    );
+  }
 
   for (const file of files) {
-    const state = await readFileState(repositoryRoot, file);
+    if (loadedFiles.length >= configuration.maxContextFiles) {
+      skipped.push({ path: file, reason: 'file-count limit' });
+      continue;
+    }
+
+    let state;
+
+    try {
+      state = await readFileState(repositoryRoot, file);
+    } catch (error) {
+      skipped.push({
+        path: file,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+      continue;
+    }
 
     if (!state.exists) {
-      throw new Error(`Context file no longer exists: ${file}`);
+      skipped.push({ path: file, reason: 'file no longer exists' });
+      continue;
     }
 
     const content = decodeContext(state.bytes, file);
+    const chunk = fileContextChunk(requestId, file, state, content);
+    const projectedChunks = [...chunks, chunk];
+    const projectedLoaded = [...loadedFiles, file];
+    const projectedPrompt = createPrompt(
+      joinedContext(projectedChunks),
+      projectedLoaded
+    );
+    const reason = contextLimitReason({
+      fileCount: loadedFiles.length,
+      contentCharacters: totalCharacters,
+      nextContentCharacters: content.length,
+      projectedPromptCharacters: projectedPrompt.length,
+      maxFiles: configuration.maxContextFiles,
+      maxContextCharacters: configuration.maxContextCharacters,
+      maxCharactersPerFile: configuration.maxCharactersPerFile,
+      maxPromptCharacters: configuration.maxPromptCharacters
+    });
 
-    if (content.length > configuration.maxCharactersPerFile) {
-      throw new Error(
-        `${file} exceeds duoAgent.maxCharactersPerFile.`
-      );
-    }
-
-    if (
-      totalCharacters + content.length >
-      configuration.maxContextCharacters
-    ) {
-      throw new Error(
-        'Selected context exceeds duoAgent.maxContextCharacters.'
-      );
+    if (reason) {
+      skipped.push({ path: file, reason });
+      continue;
     }
 
     totalCharacters += content.length;
+    loadedFiles.push(file);
+    chunks.push(chunk);
     snapshots.push({
       path: file,
       sha256: state.sha256,
       size: state.bytes.length,
       wasDirty: state.wasDirty
     });
-    chunks.push(
-      `FILE_CONTEXT_BEGIN ${requestId}\n` +
-        `PATH: ${file}\n` +
-        `SHA256: ${state.sha256}\n` +
-        `SOURCE: ${state.wasDirty ? 'UNSAVED_EDITOR_BUFFER' : 'FILE'}\n` +
-        `CONTENT_BEGIN ${requestId}\n${content}\n` +
-        `CONTENT_END ${requestId}\n` +
-        `FILE_CONTEXT_END ${requestId}`
-    );
+    prompt = projectedPrompt;
   }
 
   const editor = vscode.window.activeTextEditor;
@@ -224,42 +300,52 @@ async function readContext(
       repositoryRoot,
       editor.document.uri.fsPath
     );
-    const alreadyFullContext = files.some(
+    const alreadyFullContext = loadedFiles.some(
       file => pathKey(file) === pathKey(relativePath ?? '')
     );
 
     if (relativePath && relativePath !== '.' && !alreadyFullContext) {
       const selection = editor.document.getText(editor.selection);
-
-      if (selection.length > configuration.maxCharactersPerFile) {
-        throw new Error(
-          'Active selection exceeds duoAgent.maxCharactersPerFile.'
-        );
-      }
-
-      if (
-        totalCharacters + selection.length >
-        configuration.maxContextCharacters
-      ) {
-        throw new Error(
-          'Selected files plus the active selection exceed ' +
-            'duoAgent.maxContextCharacters.'
-        );
-      }
-
-      chunks.push(
+      const selectionChunk =
         `ACTIVE_SELECTION_BEGIN ${requestId}\n` +
           `PATH: ${relativePath}\n${selection}\n` +
-          `ACTIVE_SELECTION_END ${requestId}`
+          `ACTIVE_SELECTION_END ${requestId}`;
+      const projectedChunks = [...chunks, selectionChunk];
+      const projectedPrompt = createPrompt(
+        joinedContext(projectedChunks),
+        loadedFiles
       );
+      const reason = contextLimitReason({
+        fileCount: loadedFiles.length,
+        contentCharacters: totalCharacters,
+        nextContentCharacters: selection.length,
+        projectedPromptCharacters: projectedPrompt.length,
+        maxFiles: configuration.maxContextFiles + 1,
+        maxContextCharacters: configuration.maxContextCharacters,
+        maxCharactersPerFile: configuration.maxCharactersPerFile,
+        maxPromptCharacters: configuration.maxPromptCharacters
+      });
+
+      if (reason) {
+        skipped.push({
+          path: `${relativePath} (active selection)`,
+          reason
+        });
+      } else {
+        chunks.push(selectionChunk);
+        totalCharacters += selection.length;
+        prompt = projectedPrompt;
+      }
     }
   }
 
   return {
-    contextText:
-      chunks.join('\n\n') ||
-      'No complete file context was selected.',
-    snapshots
+    contextText: joinedContext(chunks),
+    snapshots,
+    loadedFiles,
+    skipped,
+    totalCharacters,
+    prompt
   };
 }
 
@@ -501,32 +587,49 @@ async function runTask(extensionContext) {
       configuration.maxFilePickerEntries
     )
   );
-  const contextFiles = await chooseContextFiles(
+  const contextPool = await chooseContextPool(
     repositoryRoot,
     allFiles,
     configuration
   );
   const requestId = randomUUID();
-  const collected = await readContext(
-    repositoryRoot,
-    contextFiles,
-    configuration,
-    requestId
-  );
+  const openPaths = openRepositoryDocumentPaths(repositoryRoot);
   const inventory = [...new Set([
     ...allFiles,
-    ...openRepositoryDocumentPaths(repositoryRoot)
+    ...openPaths
   ])]
     .sort((left, right) => left.localeCompare(right))
     .slice(0, configuration.maxTreeEntries);
-  const prompt = buildMasterPrompt({
-    requestId,
+  const rankedContext = rankContextFiles({
+    files: contextPool,
+    activePath: activeRelativePath,
     task: task.trim(),
-    allowedPaths,
-    allowDelete,
-    files: inventory,
-    contextText: collected.contextText
+    openPaths,
+    allowedPaths
   });
+  const createPrompt = (contextText, loadedFiles) =>
+    buildMasterPrompt({
+      requestId,
+      task: task.trim(),
+      allowedPaths,
+      allowDelete,
+      files: inventory,
+      contextText,
+      contextCatalog: buildContextCatalog(
+        contextPool,
+        loadedFiles
+      ),
+      targetResponseCharacters:
+        configuration.targetResponseCharacters
+    });
+  const collected = await readContext(
+    repositoryRoot,
+    rankedContext,
+    configuration,
+    requestId,
+    createPrompt
+  );
+  const prompt = collected.prompt;
   const pending = {
     protocol: 'duo-agent-json-v1',
     requestId,
@@ -534,7 +637,8 @@ async function runTask(extensionContext) {
     repositoryRoot,
     branchAtRequest,
     allowedPaths,
-    contextFiles,
+    contextPool,
+    contextFiles: collected.loadedFiles,
     contextSnapshots: collected.snapshots,
     allowDelete,
     createdAt: new Date().toISOString()
@@ -547,13 +651,29 @@ async function runTask(extensionContext) {
   log(`Created request ${requestId}`);
   log(`Current branch: ${branchAtRequest || '(detached or unborn)'}`);
   log(`Writable scope: ${allowedPaths.join(', ')}`);
-  log(`Context files: ${contextFiles.join(', ') || '(none)'}`);
+  log(
+    `Accessible context: ${contextPool.join(', ') || '(none)'}`
+  );
+  log(
+    `Loaded context: ${collected.loadedFiles.join(', ') || '(none)'}`
+  );
+  for (const item of collected.skipped) {
+    log(`Context not loaded: ${item.path} (${item.reason})`);
+  }
   log(
     dirtyStatus
       ? 'Existing working changes detected and left in place.'
       : 'No existing Git working changes detected.'
   );
   log('Unsaved editor buffers are read directly; no save is required.');
+
+  vscode.window.showInformationMessage(
+    `${contextPool.length} file(s) accessible · ` +
+      `${collected.loadedFiles.length} loaded · ` +
+      `${prompt.length.toLocaleString()}/` +
+      `${configuration.maxPromptCharacters.toLocaleString()} ` +
+      'prompt characters.'
+  );
 
   const possibleResponse = await sendToGitLab(prompt);
 
