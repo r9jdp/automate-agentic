@@ -534,7 +534,6 @@ async function continueWithRequestedContext(
 
   if (!contextPool) return;
 
-  const taskId = randomUUID();
   const requestId = randomUUID();
   const round = pending.round + 1;
   const filesToLoad = uniquePaths([
@@ -902,6 +901,7 @@ async function runTask(extensionContext) {
     allFiles,
     configuration
   );
+  const taskId = randomUUID();
   const requestId = randomUUID();
   const openPaths = openRepositoryDocumentPaths(repositoryRoot);
   const inventory = [...new Set([

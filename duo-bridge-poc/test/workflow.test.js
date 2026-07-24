@@ -74,6 +74,16 @@ const configuration = {
 };
 
 async function run() {
+  const workflowSource = await fsp.readFile(
+    path.join(__dirname, '../src/workflow.js'),
+    'utf8'
+  );
+  assert.match(
+    workflowSource,
+    /const taskId = randomUUID\(\);\s+const requestId = randomUUID\(\);\s+const openPaths/
+  );
+  assert.doesNotMatch(workflowSource, /if \(!contextPool\) return;\s+const taskId = randomUUID/);
+
   const root = await fsp.mkdtemp(
     path.join(os.tmpdir(), 'duo-agent-workflow-')
   );
