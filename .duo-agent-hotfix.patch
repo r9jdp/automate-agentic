@@ -1,0 +1,51 @@
+diff --git a/duo-bridge-poc/src/workflow.js b/duo-bridge-poc/src/workflow.js
+--- a/duo-bridge-poc/src/workflow.js
++++ b/duo-bridge-poc/src/workflow.js
+@@ -516,7 +516,6 @@ async function continueWithRequestedContext(
+ 
+   if (!contextPool) return;
+ 
+-  const taskId = randomUUID();
+   const requestId = randomUUID();
+   const round = pending.round + 1;
+   const filesToLoad = uniquePaths([
+@@ -903,6 +902,7 @@ async function runTask(extensionContext) {
+     allFiles,
+     configuration
+   );
++  const taskId = randomUUID();
+   const requestId = randomUUID();
+   const openPaths = openRepositoryDocumentPaths(repositoryRoot);
+   const inventory = [...new Set([
+diff --git a/duo-bridge-poc/test/workflow.test.js b/duo-bridge-poc/test/workflow.test.js
+--- a/duo-bridge-poc/test/workflow.test.js
++++ b/duo-bridge-poc/test/workflow.test.js
+@@ -78,6 +78,16 @@ const configuration = {
+ };
+ 
+ async function run() {
++  const workflowSource = await fsp.readFile(
++    path.join(__dirname, '../src/workflow.js'),
++    'utf8'
++  );
++  assert.match(
++    workflowSource,
++    /const taskId = randomUUID\(\);\s+const requestId = randomUUID\(\);\s+const openPaths/
++  );
++  assert.doesNotMatch(workflowSource, /if \(!contextPool\) return;\s+const taskId = randomUUID/);
++
+   const root = await fsp.mkdtemp(
+     path.join(os.tmpdir(), 'duo-agent-workflow-')
+   );
+diff --git a/duo-bridge-poc/package.json b/duo-bridge-poc/package.json
+--- a/duo-bridge-poc/package.json
++++ b/duo-bridge-poc/package.json
+@@ -4,7 +4,7 @@
+   "name": "duo-bridge-poc",
+   "displayName": "Duo Agent",
+   "description": "Turns GitLab Duo responses into reviewed file changes on the current branch without requiring a clean working tree.",
+-  "version": "0.6.0",
++  "version": "0.6.1",
+   "private": true,
+   "publisher": "local",
+   "engines": {
